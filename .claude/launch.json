@@ -1,0 +1,26 @@
+{
+  // Preview configuration for the Claude Code desktop app (Browser pane).
+  // Pick the entry for your platform in the server dropdown; the launcher
+  // creates the virtual environment, installs the dependencies and generates
+  // the demo PDFs on the first run. NO_BROWSER keeps the launcher from opening
+  // a second, external browser window next to the preview pane.
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Immigration Processor (macOS/Linux)",
+      "runtimeExecutable": "./run.sh",
+      "runtimeArgs": [],
+      "cwd": "ImmigrationProcessor",
+      "port": 8501,
+      "env": { "NO_BROWSER": "1" }
+    },
+    {
+      "name": "Immigration Processor (Windows)",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", "run.bat"],
+      "cwd": "ImmigrationProcessor",
+      "port": 8501,
+      "env": { "NO_BROWSER": "1" }
+    }
+  ]
+}

@@ -45,6 +45,27 @@ Für den vollen KI-Betrieb die Werte in `.env` eintragen
 
 ---
 
+## In der Claude Code Desktop-App (ohne Terminal)
+
+Die Desktop-App kann die App selbst starten und im **Browser-Pane** anzeigen.
+Die passende Konfiguration liegt im Repo unter `.claude/launch.json`.
+
+1. Session in der Desktop-App öffnen (im Web-Chat oben rechts über die drei
+   Punkte: **Öffnen in → Desktop App**).
+2. Wichtig: Die Session muss **lokal** laufen (Environment-Dropdown → *Local*),
+   damit `localhost` dein Rechner ist. Eine reine Cloud-Session startet den
+   Server im Container, den der Browser-Pane nicht erreicht.
+3. Im Server-Dropdown die Konfiguration für dein System wählen:
+   *Immigration Processor (macOS/Linux)* oder *(Windows)* - oder Claude
+   einfach bitten, die App zu starten.
+
+Der Preview-Server läuft dann auf `http://localhost:8501`. Beim ersten Start
+legt er Umgebung, Abhängigkeiten und Demo-PDFs selbst an (dauert ca. 30 s);
+danach startet er in wenigen Sekunden. `NO_BROWSER=1` sorgt dafür, dass kein
+zweites Browserfenster neben dem Pane aufgeht.
+
+---
+
 ## Requirements
 
 * Python 3.10 or newer

@@ -75,7 +75,11 @@ for _ in $(seq 1 60); do
     break  # Streamlit stopped on its own - its output explains why
   fi
   if "${VENV_PYTHON}" -c "import socket,sys; socket.create_connection(('127.0.0.1', ${APP_PORT}), 0.5)" 2>/dev/null; then
-    "${VENV_PYTHON}" -c "import webbrowser; webbrowser.open('http://localhost:${APP_PORT}')" 2>/dev/null || true
+    # NO_BROWSER=1 is set by the Claude Code desktop preview, which opens the
+    # page in its own Browser pane.
+    if [ -z "${NO_BROWSER:-}" ]; then
+      "${VENV_PYTHON}" -c "import webbrowser; webbrowser.open('http://localhost:${APP_PORT}')" 2>/dev/null || true
+    fi
     break
   fi
   sleep 0.5

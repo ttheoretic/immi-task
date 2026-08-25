@@ -57,6 +57,8 @@ echo Close this window or press Ctrl+C to stop.
 echo.
 REM Open the browser a few seconds after the server started. Streamlit itself
 REM runs headless, which also skips its first-run e-mail prompt.
-start "" /b cmd /c "timeout /t 6 /nobreak >nul & start "" http://localhost:%PORT%"
+REM NO_BROWSER=1 is set by the Claude Code desktop preview, which opens the
+REM page in its own Browser pane.
+if "%NO_BROWSER%"=="" start "" /b cmd /c "timeout /t 6 /nobreak >nul & start "" http://localhost:%PORT%"
 "%VENV_PYTHON%" -m streamlit run app.py --server.port %PORT% --server.headless true --browser.gatherUsageStats false
-pause
+if "%NO_BROWSER%"=="" pause
