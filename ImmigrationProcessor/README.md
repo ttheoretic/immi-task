@@ -33,9 +33,23 @@ git clone -b claude/immigration-document-processor-knw7i0 \
   https://github.com/ttheoretic/immi-task.git
 ```
 
-oder auf GitHub über **Code → Download ZIP** und entpacken. Beim ZIP-Weg
-markiert macOS die Dateien als Download: dann `run.command` einmal per
-Rechtsklick → **Öffnen** starten statt per Doppelklick.
+oder auf GitHub über **Code → Download ZIP** und entpacken.
+
+Beim ZIP-Weg markiert macOS die Dateien als Download (Quarantäne-Flag), und
+der erste Doppelklick wird mit *"stammt von einem nicht verifizierten
+Entwickler"* abgelehnt. Drei Wege daran vorbei:
+
+* **Systemeinstellungen → Datenschutz & Sicherheit** öffnen, dort steht direkt
+  nach dem abgelehnten Versuch **"Dennoch öffnen"**. (Auf macOS Sequoia der
+  einzige Klickweg - der frühere Rechtsklick → *Öffnen* ist dort deaktiviert;
+  auf Sonoma und älter funktioniert er noch.)
+* **Im Terminal starten**: `./run.sh` - Gatekeeper prüft nur Starts über den
+  Finder, nicht über das Terminal.
+* **Quarantäne-Flag entfernen**:
+  `xattr -dr com.apple.quarantine <entpackter Ordner>`
+
+Mit `git clone` entsteht das Flag gar nicht erst; dort funktioniert der
+Doppelklick sofort.
 
 Der Starter legt beim ersten Mal automatisch eine virtuelle Umgebung an,
 installiert die Abhängigkeiten, erzeugt Demo-PDFs und öffnet die App im
@@ -148,6 +162,7 @@ All settings live in `.env` (see the comments in that file). The most relevant:
 | --- | --- |
 | `Python 3 was not found` | Install Python 3.10+; on Windows tick *Add python.exe to PATH* |
 | Browser says the address is invalid on **Open in > Desktop app** | The desktop app isn't installed - that menu entry opens a `claude://` deep link. Install it, or use `git clone` + `./run.sh` instead |
+| macOS: *"run.command can't be opened, unidentified developer"* | Quarantine flag from the ZIP download. System Settings > Privacy & Security > **Open Anyway**, or start `./run.sh` from Terminal, or use `git clone` instead of the ZIP |
 | Port already in use | `PORT=9000 ./run.sh` |
 | Browser does not open | Open <http://localhost:8501> manually |
 | Everything says `REVIEW REQUIRED` | Expected without Azure credentials - fill in `.env` |
