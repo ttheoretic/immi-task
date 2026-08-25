@@ -21,6 +21,7 @@ from modules.classifier import (
     DocumentClassifier,
     ExtractionResult,
     get_spec,
+    score_confidence,
 )
 from modules.export import ExportResult, Exporter
 from modules.folder_manager import FolderManager, StorageError
@@ -198,6 +199,8 @@ class ProcessingPipeline:
                 logger.exception("Unexpected error while processing %s", upload.name)
                 documents.append(self._failed_document(upload.name, f"unexpected error: {exc}"))
 
+        self._propagate_within_batch(documents)
+
         report("Batch finished", 1.0)
         ready = sum(1 for document in documents if not document.requires_review and not document.error)
         logger.info(
@@ -257,6 +260,60 @@ class ProcessingPipeline:
         for segment, part in zip(segments, parts):
             documents.append(self._build_document(upload.name, source_path, segment, part.path, part.page_range))
         return documents
+
+    def _propagate_within_batch(self, documents: Sequence[ProcessedDocument]) -> None:
+        """Fill in the employer from other documents of the same batch.
+
+        A passport never names an employer, a marriage certificate neither -
+        but the CV or the payslip in the same upload does, and a case worker
+        would copy it across by hand. Only documents belonging to the same
+        person are used, or a single employer that the whole batch agrees on.
+        Every propagated value is marked in the evidence.
+        """
+        by_person: dict[tuple[str, str], str] = {}
+        companies: set[str] = set()
+        for document in documents:
+            result = document.result
+            if document.error or not result.company:
+                continue
+            companies.add(result.company)
+            key = (result.last_name.lower(), result.first_name.lower())
+            if all(key) and key not in by_person:
+                by_person[key] = result.company
+
+        # The batch-wide fallback is only safe when the whole upload is about one
+        # person and one employer; otherwise names must match document by document.
+        people = {
+            (d.result.last_name.lower(), d.result.first_name.lower())
+            for d in documents
+            if not d.error and d.result.last_name and d.result.first_name
+        }
+        single_company = (
+            next(iter(companies)) if len(companies) == 1 and len(people) <= 1 else ""
+        )
+        if not by_person and not single_company:
+            return
+
+        for document in documents:
+            result = document.result
+            if document.error or result.company:
+                continue
+            key = (result.last_name.lower(), result.first_name.lower())
+            company = by_person.get(key) or (single_company if all(key) else "")
+            if not company:
+                continue
+
+            result.company = company
+            result.evidence.append("company from another document in this batch")
+            spec = get_spec(result.document_type)
+            result.confidence = score_confidence(result, spec, self._settings)
+            document.report = self._validator.validate(result, spec)
+            document.filename = self._renamer.build(result, spec)
+            logger.info(
+                "Employer %r taken from another document of this batch for %s -> %s (%.0f%%, %s)",
+                company, document.source_name, document.filename,
+                result.confidence * 100, document.report.status,
+            )
 
     def _build_document(
         self,
@@ -322,7 +379,7 @@ class ProcessingPipeline:
         result = document.result
         for key in (
             "first_name", "last_name", "company", "document_type",
-            "valid_until", "city", "relationship", "dependent_name", "period",
+            "valid_until", "city", "relationship", "dependent_name", "period", "title",
         ):
             if key in changes:
                 setattr(result, key, str(changes[key] or "").strip())

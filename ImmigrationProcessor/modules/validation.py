@@ -237,6 +237,7 @@ class DocumentValidator:
         result.dependent_name = tidy_name(result.dependent_name)
         result.company = tidy_company(result.company)
         result.city = tidy_name(result.city)
+        result.title = re.sub(r"\s+", " ", str(result.title or "")).strip(" .:-_")
         normalised_date = normalise_date_string(result.valid_until)
         if result.valid_until and not normalised_date:
             logger.debug("Could not parse validity date %r", result.valid_until)
@@ -301,6 +302,11 @@ class DocumentValidator:
 
         if spec.requires_city and not result.city:
             add(ValidationIssue("city", "city required for town hall documents"))
+
+        if spec.requires_title and not result.title:
+            add(ValidationIssue(
+                "title", "this document is outside the naming convention and needs a title"
+            ))
 
         if result.relationship == "child" and not result.dependent_name:
             add(ValidationIssue("dependent_name", "given name of the child required", severity="warning"))

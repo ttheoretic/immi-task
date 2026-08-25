@@ -19,8 +19,15 @@ from typing import Any, Sequence
 import streamlit as st
 
 from config import SETTINGS, configure_logging, get_logger
-from modules.classifier import DOCUMENT_TYPES, UNKNOWN_TYPE_KEY, type_choices
+from modules.classifier import (
+    DOCUMENT_TYPES,
+    OTHER_TYPE_KEY,
+    UNKNOWN_TYPE_KEY,
+    get_spec,
+    type_choices,
+)
 from modules.export import ExportError, ExportResult
+from modules.ocr import TesseractEngine, install_hint as ocr_install_hint
 from modules.pipeline import (
     STAGES,
     ProcessedDocument,
@@ -80,8 +87,10 @@ def render_sidebar(pipeline: ProcessingPipeline) -> None:
 
         if SETTINGS.ocr_enabled:
             st.success(f"OCR: Document Intelligence ({SETTINGS.document_intelligence.model_id})")
+        elif local_ocr_ready():
+            st.success("OCR: local tesseract")
         else:
-            st.info("OCR: local only (tesseract, if installed)")
+            st.warning(f"OCR: none - scans stay empty. Install: `{ocr_install_hint()}`")
 
         st.caption(
             f"Confidence threshold: **{SETTINGS.confidence_threshold:.0%}** - anything below is "
@@ -109,6 +118,12 @@ def render_sidebar(pipeline: ProcessingPipeline) -> None:
         if st.button("Clean temp folder", use_container_width=True):
             removed = pipeline.folders.cleanup_temp(older_than_hours=0)
             st.toast(f"Removed {removed} temporary folder(s)")
+
+
+@st.cache_resource(show_spinner=False)
+def local_ocr_ready() -> bool:
+    """Check once per session whether a local tesseract is usable."""
+    return TesseractEngine().is_available
 
 
 def read_log_tail(lines: int = 40) -> str:
@@ -257,6 +272,7 @@ def render_document_card(pipeline: ProcessingPipeline, document: ProcessedDocume
                     index=type_options.index(current_type),
                     format_func=lambda key: (
                         "-- unclassified --" if key == UNKNOWN_TYPE_KEY
+                        else "other document (own title)" if key == OTHER_TYPE_KEY
                         else f"{DOCUMENT_TYPES[key].label_template} ({DOCUMENT_TYPES[key].description})"
                     ),
                     key=f"type_{document.id}",
@@ -285,6 +301,15 @@ def render_document_card(pipeline: ProcessingPipeline, document: ProcessedDocume
                 fields["period"] = extra_columns[1].text_input(
                     "Payslip period (YYYY-MM)", value=document.result.period, key=f"period_{document.id}"
                 )
+
+                if get_spec(document.result.document_type).requires_title or document.result.title:
+                    fields["title"] = st.text_input(
+                        "Document title (used as the file name prefix)",
+                        value=document.result.title,
+                        key=f"title_{document.id}",
+                        help="For documents outside the naming convention, e.g. "
+                             "'MB Business Contact' or 'Travel Information Sheet'.",
+                    )
 
                 dependent_columns = st.columns([1, 1, 1])
                 fields["relationship"] = dependent_columns[0].selectbox(

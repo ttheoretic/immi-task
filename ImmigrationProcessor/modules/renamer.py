@@ -117,6 +117,9 @@ class FileNameBuilder:
             "validity": sanitise_part(result.valid_until),
             "period": sanitise_part(result.period),
             "city": sanitise_part(result.city),
+            # Documents outside the convention carry their own title, e.g.
+            # "MB Business Contact_Smith_John_Microsoft.pdf".
+            "title": sanitise_part(result.title),
         }
         chunks: list[str] = []
         for chunk in spec.label_template.split("_"):
@@ -128,7 +131,12 @@ class FileNameBuilder:
                 )
                 continue
             chunks.append(_PLACEHOLDER.sub(lambda match: values.get(match.group(1), ""), chunk))
-        return "_".join(chunk for chunk in chunks if chunk) or spec.label_template.split("_")[0]
+        rendered = "_".join(chunk for chunk in chunks if chunk)
+        if rendered:
+            return rendered
+        # Nothing could be resolved (e.g. "other" without a title yet).
+        fallback = spec.label_template.split("_")[0]
+        return self._unknown if "{" in fallback else fallback
 
     def _relationship_part(self, result: ExtractionResult, spec: DocumentTypeSpec) -> str:
         """Return the dependant token (``spouse`` / ``child 1_Emily``)."""

@@ -50,7 +50,16 @@ if not exist "data\incoming\samples" (
     "%VENV_PYTHON%" create_test_pdfs.py
 )
 
-REM 5) Start ------------------------------------------------------------------
+REM 5) Optional local OCR engine ----------------------------------------------
+where tesseract >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo NOTE: tesseract is not installed - scanned PDFs cannot be read locally.
+    echo       Install it with:  winget install -e --id UB-Mannheim.TesseractOCR
+    echo       ^(Digital PDFs work regardless.^)
+)
+
+REM 6) Start ------------------------------------------------------------------
 echo.
 echo Starting Immigration Document Processor on http://localhost:%PORT%
 echo Close this window or press Ctrl+C to stop.

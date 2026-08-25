@@ -13,6 +13,10 @@ into the upload area:
 * ``birth_certificate_child.pdf`` - dependant document (child naming rule).
 * ``scanned_passport.pdf`` - image only, no text layer; demonstrates the OCR
   path (and, without Azure credentials, the REVIEW REQUIRED gate).
+* ``cv_smith.pdf``          - CV whose name is only the largest line on page
+  one, with no label at all; demonstrates the heading based name detection.
+* ``mb_business_contact.pdf`` - a document outside the naming convention;
+  demonstrates the title based file name.
 
 The content is fictitious.
 """
@@ -90,6 +94,30 @@ Mutter / Mother: Maria Smith
 """
 
 
+def _write_layout_pdf(path: Path, blocks: list[tuple[str, float]]) -> None:
+    """Write a one-page PDF from ``(text, font_size)`` blocks, top to bottom.
+
+    Font sizes matter: the application detects headings typographically, so the
+    demo files have to carry a real visual hierarchy.
+    """
+    document = pymupdf.open()
+    try:
+        page = document.new_page()
+        cursor = 70.0
+        for text, size in blocks:
+            lines = text.count("\n") + 1
+            height = lines * size * 1.5 + 12
+            overflow = page.insert_textbox(
+                pymupdf.Rect(55, cursor, 555, cursor + height), text, fontsize=size
+            )
+            if overflow < 0:  # fail loudly: a silently empty demo is worse
+                raise RuntimeError(f"text does not fit into the box: {text[:40]!r}")
+            cursor += height + 6
+        document.save(path)
+    finally:
+        document.close()
+
+
 def _write_text_pdf(path: Path, pages: list[str]) -> None:
     """Write a PDF with one text page per entry of *pages*."""
     document = pymupdf.open()
@@ -134,6 +162,38 @@ def main() -> int:
     _write_text_pdf(OUTPUT_DIR / "payslip_july.pdf", [PAYSLIP_PAGE])
     _write_text_pdf(OUTPUT_DIR / "birth_certificate_child.pdf", [BIRTH_CERTIFICATE_PAGE])
     _write_scanned_pdf(OUTPUT_DIR / "scanned_passport.pdf", PASSPORT_PAGE_1)
+
+    # A CV: the name is the largest line and carries no label whatsoever.
+    _write_layout_pdf(
+        OUTPUT_DIR / "cv_smith.pdf",
+        [
+            ("John Smith", 24),
+            ("Senior Software Engineer | john.smith@example.com | Munich", 10),
+            ("Curriculum Vitae", 15),
+            ("Work experience", 13),
+            ("2019 - today   Microsoft Deutschland GmbH, Munich\n"
+             "               Lead developer, cloud platform team", 10),
+            ("2014 - 2019    Contoso Ltd, Manchester\n"
+             "               Software engineer", 10),
+            ("Education", 13),
+            ("2010 - 2014    University of Manchester, BSc Computer Science", 10),
+            ("Skills", 13),
+            ("Python, SQL, Kubernetes, German (B2), English (native)", 10),
+        ],
+    )
+
+    # A document outside the naming convention: it keeps its own title.
+    _write_layout_pdf(
+        OUTPUT_DIR / "mb_business_contact.pdf",
+        [
+            ("MB Business Contact", 20),
+            ("Employee data sheet for the immigration file", 11),
+            ("Last name: Smith\nFirst name: John\n"
+             "Employer: Microsoft Deutschland GmbH\n"
+             "Business contact: Anna Weber, HR Mobility\n"
+             "Phone: +49 89 1234567\nEmail: mobility@example.com", 11),
+        ],
+    )
 
     print(f"Demo PDFs created in: {OUTPUT_DIR}")
     for pdf in sorted(OUTPUT_DIR.glob("*.pdf")):

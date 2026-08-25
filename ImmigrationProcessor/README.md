@@ -102,8 +102,19 @@ zweites Browserfenster neben dem Pane aufgeht.
 ## Requirements
 
 * Python 3.10 or newer
-* Optional for local OCR without Azure: the tesseract binary
-  (`brew install tesseract tesseract-lang` / `apt-get install tesseract-ocr tesseract-ocr-deu`)
+* **For scanned PDFs**: an OCR engine. Either Azure Document Intelligence
+  (credentials in `.env`) or a local tesseract - without one, scans stay empty
+  and always land in review:
+
+  | System | Command |
+  | --- | --- |
+  | macOS | `brew install tesseract tesseract-lang` |
+  | Debian/Ubuntu | `sudo apt-get install tesseract-ocr tesseract-ocr-deu` |
+  | Windows | `winget install -e --id UB-Mannheim.TesseractOCR` |
+
+  The launcher prints this hint at startup when tesseract is missing, and the
+  sidebar shows which OCR engine is actually in use. Digital PDFs work without
+  any of it.
 
 ## Two stages: rules first, model only as fallback
 
@@ -115,11 +126,39 @@ The extraction runs in two stages, and the first one needs no model at all:
      output,
    * anchors per document type (`Husband:`, `Abrechnungsmonat:`,
      `zwischen <Firma> und`, the city behind a German postal code),
-   * generic labelled fields (`Surname:`, `Arbeitgeber:`, `gültig bis`).
+   * generic labelled fields, tolerant of bilingual labels: in
+     `Name des Kindes / Name of the child: Emily` the value after the colon is
+     taken, not the second label,
+   * **names without any label**: the applicant's name on a CV is simply the
+     largest line on page one, detected typographically from the font sizes,
+   * **company by legal form**: `GmbH`, `AG`, `SE`, `KG`, `Ltd`, `Inc`, `B.V.`,
+     `S.A.` and friends; on a CV the employer is taken from the work experience
+     section rather than from the university,
+   * **employer across the batch**: a passport never names an employer, but the
+     CV or payslip in the same upload does - the value is copied to the other
+     documents of the same person and marked as such in the evidence.
 2. **LLM fallback** - only the documents the rules could *not* resolve are
    handed to a model: a local Ollama by default, Azure OpenAI when configured
    that way. If the page grouping itself looks doubtful, the whole document is
    re-analysed by the model.
+
+### Documents outside the naming convention
+
+Not every document fits the 22 types. A readable document that matches none of
+them is not "unclassified": it keeps the general file name rule and uses its
+own heading as the prefix, so it still lands in the right client folder:
+
+```
+MB Business Contact_Smith_John_Microsoft Deutschland GmbH.pdf
+Travel Information Sheet_Smith_John_Microsoft Deutschland GmbH.pdf
+```
+
+The title comes from the largest line on the page, is normalised to title case
+and snapped onto a known spelling where one exists (`KNOWN_OTHER_TITLES` in
+`modules/classifier.py` - extend that tuple with the titles your office sees
+regularly). It can be corrected in the review screen like any other field, and
+the LLM fallback is told to answer `other` plus a title rather than forcing a
+document into a type that does not fit.
 
 The confidence follows the evidence: a verified MRZ scores 0.95, every file
 name field from a labelled anchor scores `RULE_TRUSTED_CONFIDENCE` (0.92), and

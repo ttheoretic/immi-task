@@ -34,6 +34,7 @@ from modules.validation import (
 logger = get_logger(__name__)
 
 UNKNOWN_TYPE_KEY = "unknown"
+OTHER_TYPE_KEY = "other"
 
 
 class ClassificationError(RuntimeError):
@@ -67,6 +68,7 @@ class DocumentTypeSpec:
     requires_validity: bool = False
     requires_period: bool = False
     requires_city: bool = False
+    requires_title: bool = False
     relationship_in_label: bool = False
 
     @property
@@ -337,12 +339,23 @@ DOCUMENT_TYPES: dict[str, DocumentTypeSpec] = {
     )
 }
 
-#: Internal-only pseudo type for documents that could not be classified.  Files
-#: carrying it are always routed to ``data/review`` and can never be exported.
+#: Internal-only pseudo type for documents no text could be read from. Files
+#: carrying it are always routed to ``data/review``.
 UNKNOWN_SPEC = DocumentTypeSpec(
     key=UNKNOWN_TYPE_KEY,
     label_template="00_unclassified",
     description="Could not be classified - manual review required",
+)
+
+#: Documents that are perfectly readable but simply are not part of the closed
+#: naming convention ("MB Business Contact", "Travel Information Sheet", ...).
+#: They keep the general file name rule and use their own title as the prefix:
+#: ``<Title>_<LastName>_<FirstName>_<Company>.pdf``.
+OTHER_SPEC = DocumentTypeSpec(
+    key=OTHER_TYPE_KEY,
+    label_template="{title}",
+    description="Other document (outside the naming convention)",
+    requires_title=True,
 )
 
 
@@ -350,12 +363,18 @@ def get_spec(document_type: str | None) -> DocumentTypeSpec:
     """Return the catalogue entry for *document_type* (``UNKNOWN_SPEC`` if absent)."""
     if not document_type:
         return UNKNOWN_SPEC
-    return DOCUMENT_TYPES.get(document_type.strip(), UNKNOWN_SPEC)
+    key = document_type.strip()
+    if key == OTHER_TYPE_KEY:
+        return OTHER_SPEC
+    return DOCUMENT_TYPES.get(key, UNKNOWN_SPEC)
 
 
 def type_choices() -> list[str]:
-    """Return all selectable type keys for the review UI (unknown first)."""
-    return [UNKNOWN_TYPE_KEY] + sorted(DOCUMENT_TYPES, key=lambda k: DOCUMENT_TYPES[k].label_template)
+    """Return all selectable type keys for the review UI."""
+    return (
+        [UNKNOWN_TYPE_KEY, OTHER_TYPE_KEY]
+        + sorted(DOCUMENT_TYPES, key=lambda k: DOCUMENT_TYPES[k].label_template)
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -399,10 +418,14 @@ class ExtractionResult:
     dependent_name: str = ""       # given name of the child (naming rule)
     child_index: int | None = None  # "child 1", "child 2", ...
     period: str = ""               # payslip period, YYYY-MM
+    title: str = ""                # own title of a document outside the convention
     source: str = "rules"          # "rules" | "ollama" | "azure_openai" | "manual"
     notes: str = ""
     #: Why the values are what they are - shown in the review screen.
     evidence: list[str] = field(default_factory=list)
+    #: Confidence of the pure keyword match, kept so the score can be
+    #: recomputed after a field was filled in later (batch propagation).
+    keyword_confidence: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         """Return the mandatory extraction schema (plus naming extras)."""
@@ -418,6 +441,7 @@ class ExtractionResult:
             "dependent_name": self.dependent_name,
             "child_index": self.child_index,
             "period": self.period,
+            "title": self.title,
         }
 
     @classmethod
@@ -444,9 +468,16 @@ class ExtractionResult:
             child_index = None
 
         document_type = text("document_type")
-        if document_type not in DOCUMENT_TYPES:
-            logger.warning("AI returned unknown document_type %r - flagged as unclassified", document_type)
-            document_type = UNKNOWN_TYPE_KEY
+        title = text("title")
+        if document_type == OTHER_TYPE_KEY:
+            if not title:  # "other" without a title cannot produce a file name
+                logger.warning("Model returned 'other' without a title - needs review")
+                confidence = min(confidence, 0.4)
+        elif document_type not in DOCUMENT_TYPES:
+            logger.warning(
+                "Model returned unknown document_type %r - treated as 'other'", document_type
+            )
+            document_type = OTHER_TYPE_KEY if title else UNKNOWN_TYPE_KEY
             confidence = min(confidence, 0.4)
 
         return cls(
@@ -461,6 +492,7 @@ class ExtractionResult:
             dependent_name=text("dependent_name"),
             child_index=child_index,
             period=text("period"),
+            title=title,
             source=source,
         )
 
@@ -513,21 +545,26 @@ _NAME_CHARS = r"[A-ZÄÖÜ][\w'\-äöüßéèêáàâç]*"
 #: Horizontal whitespace only: a person name never spans two lines, so the
 #: capture must stop at the line break instead of swallowing the next label.
 _H = r"[^\S\r\n]"
+#: Separator between a field label and its value. German forms are usually
+#: bilingual ("Name des Kindes / Name of the child: Emily"), so everything up
+#: to the colon on the same line is skipped; without a colon the value follows
+#: the label directly.
+_SEP = r"(?:[^\n:]{0,40}:)?[^\S\r\n]*"
 
 #: Generic labelled patterns, tried for every document type.
 _GENERIC_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("last_name", re.compile(
         r"(?:surname|family\s*name|last\s*name|name\s*/\s*surname|nachname|familienname)"
-        rf"{_H}*[:\-/]?{_H}*({_NAME_CHARS}(?:{_H}+{_NAME_CHARS})?)", re.IGNORECASE)),
+        rf"{_SEP}({_NAME_CHARS}(?:{_H}+{_NAME_CHARS})?)", re.IGNORECASE)),
     ("first_name", re.compile(
         r"(?:given\s*names?|first\s*name|forename|vorname[n]?)"
-        rf"{_H}*[:\-/]?{_H}*({_NAME_CHARS}(?:{_H}+{_NAME_CHARS})?)", re.IGNORECASE)),
+        rf"{_SEP}({_NAME_CHARS}(?:{_H}+{_NAME_CHARS})?)", re.IGNORECASE)),
     ("company", re.compile(
         r"(?:employer|company|arbeitgeber|firma|unternehmen|host\s*company)"
-        r"\s*[:\-]?\s*([A-Z0-9ÄÖÜ][\w&.,'\-äöüß ]{2,45})", re.IGNORECASE)),
+        rf"{_SEP}([A-Z0-9ÄÖÜ][\w&.,'\-äöüß ]{{2,45}})", re.IGNORECASE)),
     ("city", re.compile(
         r"(?:city|town|stadt|wohnort|ort\s*der\s*anmeldung|gemeinde|municipality)"
-        rf"{_H}*[:\-]?{_H}*({_NAME_CHARS}(?:{_H}{_NAME_CHARS})?)", re.IGNORECASE)),
+        rf"{_SEP}({_NAME_CHARS}(?:{_H}{_NAME_CHARS})?)", re.IGNORECASE)),
 )
 
 #: Per-document-type anchors. These are the standardised forms where a regex is
@@ -535,27 +572,34 @@ _GENERIC_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 _TYPE_PATTERNS: dict[str, tuple[tuple[str, re.Pattern[str]], ...]] = {
     "09_marriage_certificate": (
         ("full_name", re.compile(
-            rf"(?:husband|ehemann|spouse\s*1|partner\s*1){_H}*[:\-]?{_H}*({_NAME_CHARS}(?:{_H}+{_NAME_CHARS}){{0,2}})",
+            rf"(?:husband|ehemann|spouse\s*1|partner\s*1){_SEP}({_NAME_CHARS}(?:{_H}+{_NAME_CHARS}){{0,2}})",
             re.IGNORECASE)),
         ("city", re.compile(rf"standesamt{_H}+({_NAME_CHARS}(?:{_H}{_NAME_CHARS})?)", re.IGNORECASE)),
     ),
     "10_birth_certificate": (
         ("dependent_name", re.compile(
-            rf"(?:name\s*(?:des\s*kindes|of\s*the\s*child)|kind|child){_H}*[:\-/]?{_H}*({_NAME_CHARS}(?:{_H}+{_NAME_CHARS})?)",
+            rf"(?:name\s*(?:des\s*kindes|of\s*the\s*child)|kind|child){_SEP}({_NAME_CHARS}(?:{_H}+{_NAME_CHARS})?)",
             re.IGNORECASE)),
         ("full_name", re.compile(
-            rf"(?:vater|father){_H}*[:\-]?{_H}*({_NAME_CHARS}(?:{_H}+{_NAME_CHARS}){{0,2}})", re.IGNORECASE)),
+            rf"(?:vater|father){_SEP}({_NAME_CHARS}(?:{_H}+{_NAME_CHARS}){{0,2}})", re.IGNORECASE)),
         ("city", re.compile(rf"standesamt{_H}+({_NAME_CHARS}(?:{_H}{_NAME_CHARS})?)", re.IGNORECASE)),
     ),
     "12_payslip": (
         ("period", re.compile(
-            r"(?:abrechnungsmonat|abrechnungszeitraum|pay\s*period|lohnmonat)\s*[:\-]?\s*"
+            rf"(?:abrechnungsmonat|abrechnungszeitraum|pay{_H}*period|lohnmonat){_SEP}"
             r"(\d{1,2}\s?[./-]\s?\d{4}|\d{4}\s?-\s?\d{1,2})", re.IGNORECASE)),
     ),
     "04_employment_contract": (
         # "zwischen <Firma> und <Name>" - the standard German contract opening.
         ("company", re.compile(
             r"zwischen\s+(?:der\s+|dem\s+)?([A-Z0-9ÄÖÜ][\w&.,'\-äöüß ]{2,50}?)\s+und\b", re.IGNORECASE)),
+    ),
+    "03_cv": (
+        # A CV rarely labels anything; the name comes from the heading (see
+        # PersonNameFinder) and the employer from the work experience section.
+        ("city", re.compile(
+            rf"(?:address|anschrift|wohnhaft\s*in){_SEP}(?:[^\n]{{0,40}}?\b\d{{5}}{_H}+)?({_NAME_CHARS})",
+            re.IGNORECASE)),
     ),
     "05_assignment_letter": (
         ("company", re.compile(
@@ -601,6 +645,172 @@ def split_full_name(value: str) -> tuple[str, str]:
         return "", parts[0]
     return parts[0], parts[-1]
 
+
+# --------------------------------------------------------------------------- #
+# Person, company and title finders
+# --------------------------------------------------------------------------- #
+#: Legal forms that mark a company name beyond doubt.
+_LEGAL_FORMS = (
+    r"(?:GmbH\s*&\s*Co\.?\s*KGaA|GmbH\s*&\s*Co\.?\s*KG|gGmbH|GmbH|mbH|AG|SE|KGaA|KG|OHG|GbR|"
+    r"e\.?\s?K\.?|Ltd\.?|Limited|LLC|L\.L\.C\.|Inc\.?|Incorporated|Corp\.?|Corporation|PLC|"
+    r"B\.?V\.?|N\.?V\.?|S\.?A\.?R\.?L\.?|S\.?A\.?S\.?|S\.?A\.?|S\.?p\.?A\.?|S\.?L\.?|Oy|AB|A/S|"
+    r"Pty\.?\s*Ltd\.?|Sp\.\s?z\s?o\.o\.)"
+)
+_COMPANY_LEGAL = re.compile(
+    rf"\b([A-ZÄÖÜ][\w.&'\-äöüß]*(?:[ ][A-ZÄÖÜ0-9][\w.&'\-äöüß]*){{0,4}}[ ]{_LEGAL_FORMS})(?!\w)"
+)
+
+#: Words that disqualify a line from being a person name.
+_NOT_A_PERSON: frozenset[str] = frozenset({
+    "curriculum", "vitae", "lebenslauf", "resume", "cv", "profile", "profil",
+    "contact", "kontakt", "address", "adresse", "experience", "erfahrung",
+    "education", "ausbildung", "skills", "kenntnisse", "languages", "sprachen",
+    "certificate", "urkunde", "bescheinigung", "vertrag", "contract", "invoice",
+    "rechnung", "sheet", "information", "travel", "business", "passport",
+    "reisepass", "visa", "visum", "gmbh", "ag", "limited", "inc", "university",
+    "universitat", "universität", "hochschule", "seite", "page", "datum", "date",
+    "standesamt", "registrar", "amt", "stadt", "city", "republik", "republic",
+    "bundesrepublik", "federal", "deutschland", "germany", "krankenkasse",
+    "versicherung", "insurance", "arbeitsvertrag", "employment", "payslip",
+    "gehaltsabrechnung", "lohnabrechnung", "anmeldung", "abmeldung",
+})
+
+_PERSON_TOKEN = re.compile(r"^[A-ZÄÖÜ][A-Za-zÄÖÜäöüß'\-]{1,20}$|^[A-ZÄÖÜ]{2,20}$")
+
+#: Titles of documents outside the naming convention that appear regularly.
+#: A detected heading is snapped onto the closest entry so the same document
+#: always produces the same file name.
+KNOWN_OTHER_TITLES: tuple[str, ...] = (
+    "MB Business Contact",
+    "Travel Information Sheet",
+    "Cover Letter",
+    "Application Form",
+    "Data Privacy Consent",
+    "Certificate of Enrolment",
+    "Confirmation of Employment",
+    "Letter of Recommendation",
+    "Bank Statement",
+    "Tax Assessment",
+)
+
+_TITLE_NOISE = re.compile(r"^(?:page|seite)\s*\d+", re.IGNORECASE)
+
+
+def looks_like_person_name(value: str) -> bool:
+    """True when *value* reads like a person name ("John Smith", "SMITH JOHN")."""
+    cleaned = " ".join((value or "").replace(",", " ").split())
+    if not cleaned or any(char.isdigit() for char in cleaned):
+        return False
+    tokens = cleaned.split(" ")
+    if not 2 <= len(tokens) <= 3:
+        return False
+    if any(token.lower().strip(".") in _NOT_A_PERSON for token in tokens):
+        return False
+    return all(_PERSON_TOKEN.match(token) for token in tokens)
+
+
+class PersonNameFinder:
+    """Finds the applicant's name where no label exists - CVs above all.
+
+    A CV usually carries the name as the largest text on page one and never
+    writes "Surname:" in front of it, which is exactly why the labelled
+    patterns missed it.
+    """
+
+    @staticmethod
+    def from_headings(headings: Sequence[str]) -> tuple[str, str]:
+        """Return ``(first_name, last_name)`` from the page headings."""
+        for heading in headings:
+            if looks_like_person_name(heading):
+                return split_full_name(heading)
+        return "", ""
+
+    @staticmethod
+    def from_first_lines(text: str, max_lines: int = 8) -> tuple[str, str]:
+        """Return ``(first_name, last_name)`` from the top of the document."""
+        for line in (text or "").splitlines()[:max_lines]:
+            candidate = line.strip(" \t|-")
+            if looks_like_person_name(candidate):
+                return split_full_name(candidate)
+        return "", ""
+
+
+class CompanyFinder:
+    """Finds a company name through its legal form (GmbH, AG, Ltd, Inc, ...)."""
+
+    @staticmethod
+    def find_all(text: str) -> list[str]:
+        """Return every company-like name in document order."""
+        seen: list[str] = []
+        for match in _COMPANY_LEGAL.finditer(text or ""):
+            name = " ".join(match.group(1).split())
+            if name not in seen:
+                seen.append(name)
+        return seen
+
+    @classmethod
+    def find(cls, text: str, prefer_after: Sequence[str] = ()) -> str:
+        """Return the most plausible employer name.
+
+        Args:
+            text: Document text.
+            prefer_after: Section headings (e.g. "work experience") after which
+                the first hit is preferred - on a CV that is the current
+                employer rather than a university or a former one.
+        """
+        candidates = cls.find_all(text)
+        if not candidates:
+            return ""
+        lowered = (text or "").lower()
+        for marker in prefer_after:
+            index = lowered.find(marker.lower())
+            if index == -1:
+                continue
+            section = text[index : index + 600]
+            preferred = cls.find_all(section)
+            if preferred:
+                return preferred[0]
+        return candidates[0]
+
+
+class TitleFinder:
+    """Derives a file name title for documents outside the naming convention."""
+
+    @staticmethod
+    def normalise(value: str) -> str:
+        """Clean a heading into a title usable inside a file name."""
+        cleaned = " ".join((value or "").split()).strip(" :;.-_")
+        if not cleaned:
+            return ""
+        for known in KNOWN_OTHER_TITLES:  # snap onto a canonical spelling
+            if cleaned.lower() == known.lower():
+                return known
+        if cleaned.isupper() or cleaned.islower():
+            small = {"of", "and", "the", "for", "in", "on", "zur", "der", "die", "das", "und"}
+            words = [
+                word if word.lower() in small and index else word.capitalize()
+                for index, word in enumerate(cleaned.split(" "))
+            ]
+            cleaned = " ".join(words)
+        return cleaned[:60].strip()
+
+    @classmethod
+    def find(cls, headings: Sequence[str], text: str) -> str:
+        """Return the document's own title, or ``""`` when nothing fits."""
+        for heading in headings:
+            if looks_like_person_name(heading) or _TITLE_NOISE.match(heading):
+                continue
+            title = cls.normalise(heading)
+            if title and len(title.split()) >= 2:
+                return title
+        for line in (text or "").splitlines()[:6]:
+            candidate = line.strip()
+            if not candidate or looks_like_person_name(candidate) or _TITLE_NOISE.match(candidate):
+                continue
+            title = cls.normalise(candidate)
+            if title and 2 <= len(title.split()) <= 8:
+                return title
+        return ""
 
 # --------------------------------------------------------------------------- #
 # Passport MRZ with check digit verification
@@ -744,6 +954,57 @@ class KeywordClassifier:
         return best_key, round(min(cap, max(0.15, confidence)), 3)
 
 
+def required_fields(spec: DocumentTypeSpec) -> set[str]:
+    """Return every field the file name of *spec* needs."""
+    required = {"first_name", "last_name", "company"}
+    if spec.requires_validity:
+        required.add("valid_until")
+    if spec.requires_period:
+        required.add("period")
+    if spec.requires_city:
+        required.add("city")
+    if spec.requires_title:
+        required.add("title")
+    return required
+
+
+def score_confidence(
+    result: ExtractionResult, spec: DocumentTypeSpec, settings: Settings = SETTINGS
+) -> float:
+    """Turn the evidence recorded on *result* into an honest confidence value.
+
+    Can be called again after a field was filled in later (for example when the
+    employer was taken from another document of the same batch), because every
+    input is stored on the result itself.
+
+    A guessed value never lifts a result over the review threshold, and a
+    missing file name field always keeps it below - the name would otherwise
+    carry ``UNKNOWN``.
+    """
+    threshold = settings.confidence_threshold
+    guessed = any("guessed" in item for item in result.evidence)
+    anchored = {item.split(" ")[0] for item in result.evidence if " from " in item}
+    verified = any("MRZ verified" in item for item in result.evidence)
+    required = required_fields(spec)
+
+    if verified:
+        confidence = 0.95
+    elif required.issubset(anchored) and all(getattr(result, name, "") for name in required) and not guessed:
+        confidence = settings.rule_trusted_confidence
+    else:
+        confidence = min(result.keyword_confidence, settings.heuristic_confidence_cap)
+
+    if spec.key == UNKNOWN_TYPE_KEY:
+        confidence = min(confidence, 0.30)
+    if spec.key == OTHER_TYPE_KEY and not result.title:
+        confidence = min(confidence, 0.30)
+    if any(not getattr(result, name, "") for name in required):
+        confidence = min(confidence, threshold - 0.02)
+    if guessed:
+        confidence = min(confidence, threshold - 0.02)
+    return round(max(0.05, confidence), 3)
+
+
 class RuleFieldExtractor:
     """Extracts the mandatory fields with verifiable rules.
 
@@ -761,24 +1022,47 @@ class RuleFieldExtractor:
     def __init__(self, settings: Settings = SETTINGS) -> None:
         self._settings = settings
 
-    def extract(self, text: str, document_type: str, keyword_confidence: float) -> ExtractionResult:
-        """Extract every field the rules can reach from *text*."""
+    #: CV sections after which the first company found is the current employer.
+    _EMPLOYER_SECTIONS = (
+        "work experience", "professional experience", "berufserfahrung",
+        "employment history", "beruflicher werdegang", "arbeitgeber",
+    )
+
+    def extract(
+        self,
+        text: str,
+        document_type: str,
+        keyword_confidence: float,
+        headings: Sequence[str] = (),
+    ) -> ExtractionResult:
+        """Extract every field the rules can reach from *text*.
+
+        Args:
+            text: Plain text of the (sub-)document.
+            document_type: Type key detected by the keyword classifier.
+            keyword_confidence: Confidence of that keyword match.
+            headings: Lines set in a larger font, used for unlabelled names
+                (CVs) and for the title of documents outside the convention.
+        """
         spec = get_spec(document_type)
         result = ExtractionResult(
             document_type=document_type, confidence=keyword_confidence, source="rules"
         )
 
-        mrz = self._apply_mrz(text, result)
+        self._apply_mrz(text, result)
         self._apply_type_patterns(text, result, spec)
         self._apply_generic_patterns(text, result)
+        self._apply_finders(text, result, spec, headings)
         self._apply_positional(text, result, spec)
+        spec = get_spec(result.document_type)  # may have become "other"
 
         if spec.relationship_in_label:
             result.relationship = "spouse" if spec.key.endswith("spouse") else "child"
         if result.dependent_name and not result.relationship:
             result.relationship = "child"
 
-        result.confidence = self._confidence(result, spec, keyword_confidence, mrz)
+        result.keyword_confidence = keyword_confidence
+        result.confidence = score_confidence(result, spec, self._settings)
         return result
 
     # -- evidence sources -------------------------------------------------- #
@@ -848,6 +1132,58 @@ class RuleFieldExtractor:
                 setattr(result, field_name, value)
                 result.evidence.append(f"{field_name} from label")
 
+    def _apply_finders(
+        self,
+        text: str,
+        result: ExtractionResult,
+        spec: DocumentTypeSpec,
+        headings: Sequence[str],
+    ) -> None:
+        """Fill name, company and title where no label exists.
+
+        This is what a CV needs: the name is simply the largest line on page
+        one, and the employer is recognisable by its legal form.
+        """
+        if not (result.first_name and result.last_name):
+            first, last = PersonNameFinder.from_headings(headings)
+            source = "document heading"
+            if not last:
+                first, last = PersonNameFinder.from_first_lines(text)
+                source = "first lines"
+            if last:
+                if not result.last_name:
+                    result.last_name = last
+                    result.evidence.append(f"last_name from {source}")
+                if first and not result.first_name:
+                    result.first_name = first
+                    result.evidence.append(f"first_name from {source}")
+
+        if not result.company:
+            prefer = self._EMPLOYER_SECTIONS if spec.key == "03_cv" else ()
+            company = CompanyFinder.find(text, prefer_after=prefer)
+            if company:
+                result.company = company
+                result.evidence.append("company from legal form")
+
+        # A readable document that matches no catalogue entry is not "unknown":
+        # it is simply another document and keeps the general naming rule.
+        if result.document_type == UNKNOWN_TYPE_KEY:
+            title = TitleFinder.find(headings, text)
+            if title:
+                result.document_type = OTHER_TYPE_KEY
+                result.title = title
+                result.evidence.append(
+                    "title from heading" if any(
+                        TitleFinder.normalise(h) == title for h in headings
+                    ) else "title from first lines"
+                )
+                logger.info("Document outside the convention - titled %r", title)
+        elif spec.requires_title and not result.title:
+            title = TitleFinder.find(headings, text)
+            if title:
+                result.title = title
+                result.evidence.append("title from heading")
+
     def _apply_positional(self, text: str, result: ExtractionResult, spec: DocumentTypeSpec) -> None:
         """Dates next to an explicit hint (an anchor), or a last-resort guess."""
         if spec.requires_validity and not result.valid_until:
@@ -864,56 +1200,6 @@ class RuleFieldExtractor:
                 result.evidence.append(
                     "period from label" if from_label else "period guessed from context"
                 )
-
-    # -- confidence -------------------------------------------------------- #
-    def _confidence(
-        self,
-        result: ExtractionResult,
-        spec: DocumentTypeSpec,
-        keyword_confidence: float,
-        mrz: MrzData | None,
-    ) -> float:
-        """Turn the collected evidence into an honest confidence value.
-
-        A guessed value never lifts the result over the review threshold, and a
-        missing company always keeps it below it - the file name would carry
-        ``UNKNOWN`` otherwise.
-        """
-        threshold = self._settings.confidence_threshold
-        guessed = any("guessed" in item for item in result.evidence)
-        anchored = {
-            item.split(" ")[0] for item in result.evidence if " from " in item
-        }
-
-        if mrz and mrz.is_verified:
-            confidence = 0.95
-        elif self._all_required_anchored(result, spec, anchored) and not guessed:
-            confidence = self._settings.rule_trusted_confidence
-        else:
-            confidence = min(keyword_confidence, self._settings.heuristic_confidence_cap)
-
-        if spec.key == UNKNOWN_TYPE_KEY:
-            confidence = min(confidence, 0.30)
-        if not result.company or not result.first_name or not result.last_name:
-            # Missing pieces of the file name are always a review case.
-            confidence = min(confidence, threshold - 0.02)
-        if guessed:
-            confidence = min(confidence, threshold - 0.02)
-        return round(max(0.05, confidence), 3)
-
-    @staticmethod
-    def _all_required_anchored(
-        result: ExtractionResult, spec: DocumentTypeSpec, anchored: set[str]
-    ) -> bool:
-        """True when every field the file name needs came from a real anchor."""
-        required = {"first_name", "last_name", "company"}
-        if spec.requires_validity:
-            required.add("valid_until")
-        if spec.requires_period:
-            required.add("period")
-        if spec.requires_city:
-            required.add("city")
-        return required.issubset(anchored) and all(getattr(result, name, "") for name in required)
 
     # -- helpers ----------------------------------------------------------- #
     def _find_expiry(self, text: str) -> tuple[str, bool]:
@@ -995,7 +1281,9 @@ class RuleSegmenter:
                 key, confidence = merged_key, merged_confidence
             elif merged_key == key:
                 confidence = max(confidence, merged_confidence)
-            result = self._extractor.extract(text, key, confidence)
+            result = self._extractor.extract(
+                text, key, confidence, headings=document.headings_for_range(start, end)
+            )
             segments.append(ClassifiedSegment(start_page=start, end_page=end, result=result))
 
         logger.info(
@@ -1121,6 +1409,8 @@ class DocumentClassifier:
             return True
         spec = get_spec(result.document_type)
         missing = not (result.first_name and result.last_name and result.company)
+        if spec.requires_title and not result.title:
+            missing = True
         if spec.requires_validity and not result.valid_until:
             missing = True
         if spec.requires_period and not result.period:

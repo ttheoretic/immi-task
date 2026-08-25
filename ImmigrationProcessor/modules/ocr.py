@@ -17,6 +17,7 @@ what happened so the UI and the log can show it.
 from __future__ import annotations
 
 import io
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, Sequence
@@ -57,6 +58,10 @@ class PageText:
     number: int  # 1-based
     text: str = ""
     source: str = SOURCE_EMPTY
+    #: Lines set in a visibly larger font than the body text, in reading order.
+    #: These carry the document title ("MB Business Contact") and, on a CV, the
+    #: applicant's name - both are needed to name a file properly.
+    headings: list[str] = field(default_factory=list)
 
     @property
     def char_count(self) -> int:
@@ -110,6 +115,14 @@ class DocumentText:
         return "\n".join(
             page.text for page in self.pages if start_page <= page.number <= end_page
         ).strip()
+
+    def headings_for_range(self, start_page: int, end_page: int) -> list[str]:
+        """Return the headings of an inclusive 1-based page range."""
+        headings: list[str] = []
+        for page in self.pages:
+            if start_page <= page.number <= end_page:
+                headings.extend(page.headings)
+        return headings
 
     def snippet(self, max_chars: int = 12_000) -> str:
         """Return the document text truncated to *max_chars* for prompting."""
@@ -200,6 +213,15 @@ class AzureDocumentIntelligenceEngine:
         return pages
 
 
+def install_hint() -> str:
+    """Return the tesseract install command for the current platform."""
+    if sys.platform == "darwin":
+        return "brew install tesseract tesseract-lang"
+    if sys.platform.startswith("win"):
+        return "winget install -e --id UB-Mannheim.TesseractOCR"
+    return "sudo apt-get install tesseract-ocr tesseract-ocr-deu"
+
+
 class TesseractEngine:
     """Optional local OCR fallback (used only when ``pytesseract`` is installed)."""
 
@@ -207,6 +229,9 @@ class TesseractEngine:
         self._dpi = dpi
         self._checked = False
         self._available = False
+
+    #: Filled by :meth:`is_available` when the engine cannot be used.
+    reason: str = ""
 
     @property
     def is_available(self) -> bool:
@@ -220,9 +245,15 @@ class TesseractEngine:
 
             pytesseract.get_tesseract_version()
             self._available = Image is not None
-        except Exception as exc:  # pragma: no cover - optional dependency
-            logger.debug("Local OCR fallback unavailable: %s", exc)
+            self.reason = ""
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            self.reason = f"Python package missing ({exc.name}) - pip install -r requirements.txt"
             self._available = False
+        except Exception:
+            self.reason = "tesseract binary not found - " + install_hint()
+            self._available = False
+        if not self._available:
+            logger.info("Local OCR unavailable: %s", self.reason)
         return self._available
 
     def ocr_page(self, document: Any, page_index: int) -> str:
@@ -288,6 +319,8 @@ class PdfTextExtractor:
                     raw = ""
                 page = PageText(number=index + 1, text=raw.strip())
                 page.source = SOURCE_PYMUPDF if page.char_count else SOURCE_EMPTY
+                if page.char_count:
+                    page.headings = self._extract_headings(document, index)
                 document_text.pages.append(page)
 
             if any(page.source == SOURCE_PYMUPDF for page in document_text.pages):
@@ -314,6 +347,47 @@ class PdfTextExtractor:
         return document_text
 
     # -- internals --------------------------------------------------------- #
+    @staticmethod
+    def _extract_headings(document: Any, page_index: int, max_headings: int = 6) -> list[str]:
+        """Return the lines of a page that are set in a larger font than the body.
+
+        Uses the font sizes PyMuPDF reports per span: everything at least 15%
+        larger than the page's most common size counts as a heading. Purely
+        typographic, so it works for any language and needs no model.
+        """
+        try:
+            layout = document.load_page(page_index).get_text("dict")
+        except Exception as exc:  # pragma: no cover - broken page
+            logger.debug("Heading extraction failed on page %d: %s", page_index + 1, exc)
+            return []
+
+        lines: list[tuple[float, str]] = []
+        size_counts: dict[float, int] = {}
+        for block in layout.get("blocks", []):
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                text = " ".join(str(span.get("text", "")) for span in spans).strip()
+                if not text:
+                    continue
+                size = round(max((float(span.get("size", 0)) for span in spans), default=0.0), 1)
+                lines.append((size, text))
+                size_counts[size] = size_counts.get(size, 0) + len(text)
+
+        if not lines or not size_counts:
+            return []
+        body_size = max(size_counts.items(), key=lambda item: item[1])[0]
+        threshold = body_size * 1.15
+
+        headings: list[str] = []
+        for size, text in lines:
+            if size >= threshold and 2 < len(text) <= 80:
+                cleaned = " ".join(text.split()).strip(" :-")
+                if cleaned and cleaned not in headings:
+                    headings.append(cleaned)
+            if len(headings) >= max_headings:
+                break
+        return headings
+
     def _run_ocr(
         self,
         pdf_path: Path,
@@ -360,6 +434,7 @@ class PdfTextExtractor:
                 return
 
         logger.warning(
-            "No OCR engine available for %s - %d page(s) stay empty and will require review",
-            pdf_path.name, len(scanned_pages),
+            "No OCR engine available for %s - %d page(s) stay empty and will require review. "
+            "Install a local engine with: %s",
+            pdf_path.name, len(scanned_pages), install_hint(),
         )

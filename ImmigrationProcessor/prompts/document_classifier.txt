@@ -13,6 +13,11 @@ TASKS
 
 ALLOWED DOCUMENT TYPE KEYS (use the key verbatim, never invent a new one):
 {{DOCUMENT_TYPES}}
+- "other": a readable document that matches NONE of the keys above. Never force
+  a document into a key that does not fit - use "other" instead and fill the
+  "title" field with the document's own name, exactly as printed on it
+  (e.g. "MB Business Contact", "Travel Information Sheet", "Cover Letter").
+  Keep the original wording, drop trailing colons, use title case.
 
 DETECTION HINTS
 - 01_passport: "passport", "Reisepass", passport number, date of issue,
@@ -44,6 +49,11 @@ FIELD RULES
 - dependent_name: given name of the CHILD the document belongs to, else "".
 - child_index: 1 for the first child, 2 for the second, ... else null.
 - period: payslip period as YYYY-MM, else "".
+- title: ONLY for document_type "other" - the document's own heading, which
+  becomes the file name prefix. Empty for every catalogue type.
+- first_name / last_name on a CV: the applicant's name is usually the largest
+  line on page one and carries no label. company on a CV is the CURRENT
+  employer from the work experience section, not a university.
 - confidence: your honest overall confidence between 0.0 and 1.0 for the
   classification AND the extracted fields together. Use a value below 0.90 when
   any mandatory field is missing, unreadable or guessed. Never inflate it.
@@ -68,6 +78,7 @@ Return a single JSON object, no markdown, no commentary:
       "dependent_name": "",
       "child_index": null,
       "period": "",
+      "title": "",
       "confidence": 0.97
     }
   ]

@@ -55,7 +55,21 @@ if [ "${MAKE_SAMPLES}" = "1" ] && [ ! -d "data/incoming/samples" ]; then
   "${VENV_PYTHON}" create_test_pdfs.py || echo "WARNING: demo PDFs could not be created" >&2
 fi
 
-# 5) Start ------------------------------------------------------------------
+# 5) Optional local OCR engine ----------------------------------------------
+# Scanned PDFs need an OCR engine. Azure Document Intelligence covers it when
+# configured; otherwise tesseract does the job locally and for free.
+if ! command -v tesseract >/dev/null 2>&1; then
+  case "$(uname -s)" in
+    Darwin) OCR_HINT="brew install tesseract tesseract-lang" ;;
+    *)      OCR_HINT="sudo apt-get install tesseract-ocr tesseract-ocr-deu" ;;
+  esac
+  echo
+  echo "NOTE: tesseract is not installed - scanned PDFs cannot be read locally."
+  echo "      Install it with:  ${OCR_HINT}"
+  echo "      (Digital PDFs work regardless; the sidebar shows the OCR status.)"
+fi
+
+# 6) Start ------------------------------------------------------------------
 # Streamlit runs headless (that also skips its first-run e-mail prompt) and the
 # browser is opened by this script as soon as the port accepts connections.
 echo
