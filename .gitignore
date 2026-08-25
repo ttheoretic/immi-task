@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.streamlit/secrets.toml
+
+# Runtime artefacts - the folders themselves are kept via .gitkeep
+ImmigrationProcessor/data/incoming/*
+ImmigrationProcessor/data/processed/*
+ImmigrationProcessor/data/review/*
+ImmigrationProcessor/data/temp/*
+!ImmigrationProcessor/data/*/.gitkeep
+ImmigrationProcessor/logs/*.log*
+!ImmigrationProcessor/logs/processing.log
