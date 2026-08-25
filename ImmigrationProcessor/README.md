@@ -127,6 +127,7 @@ All settings live in `.env` (see the comments in that file). The most relevant:
 | Problem | Fix |
 | --- | --- |
 | `Python 3 was not found` | Install Python 3.10+; on Windows tick *Add python.exe to PATH* |
+| Browser says the address is invalid on **Open in > Desktop app** | The desktop app isn't installed - that menu entry opens a `claude://` deep link. Install it, or use `git clone` + `./run.sh` instead |
 | Port already in use | `PORT=9000 ./run.sh` |
 | Browser does not open | Open <http://localhost:8501> manually |
 | Everything says `REVIEW REQUIRED` | Expected without Azure credentials - fill in `.env` |
