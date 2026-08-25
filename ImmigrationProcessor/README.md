@@ -7,7 +7,15 @@ convention-compliant, reviewed files in the right client folder.
 
 ## Schnellstart (Deutsch)
 
-**macOS / Linux**
+Die App ist eine lokale Web-App: Sie startet einen Server auf deinem Rechner
+und öffnet sich in deinem normalen Browser unter <http://localhost:8501>.
+Nötig sind nur Python 3.10+ und die Dateien auf deinem Rechner.
+
+**macOS - ohne Terminal**
+
+Ordner `ImmigrationProcessor` im Finder öffnen und `run.command` doppelklicken.
+
+**macOS / Linux - im Terminal**
 
 ```bash
 cd ImmigrationProcessor
@@ -17,6 +25,17 @@ cd ImmigrationProcessor
 **Windows**
 
 Doppelklick auf `run.bat` (oder `run.bat` in der Eingabeaufforderung).
+
+**Code auf den Rechner holen** (einmalig), entweder
+
+```bash
+git clone -b claude/immigration-document-processor-knw7i0 \
+  https://github.com/ttheoretic/immi-task.git
+```
+
+oder auf GitHub über **Code → Download ZIP** und entpacken. Beim ZIP-Weg
+markiert macOS die Dateien als Download: dann `run.command` einmal per
+Rechtsklick → **Öffnen** starten statt per Doppelklick.
 
 Der Starter legt beim ersten Mal automatisch eine virtuelle Umgebung an,
 installiert die Abhängigkeiten, erzeugt Demo-PDFs und öffnet die App im
@@ -101,6 +120,7 @@ ImmigrationProcessor/
 ├── config.py              settings from .env + logging
 ├── create_test_pdfs.py    demo PDFs for testing
 ├── run.sh / run.bat       one click launchers
+├── run.command            macOS double-click launcher
 ├── data/                  incoming | processed (Clients/) | review | temp
 ├── modules/               ocr, classifier, pdf_splitter, renamer,
 │                          folder_manager, export, validation, pipeline
