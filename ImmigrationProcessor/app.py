@@ -71,19 +71,22 @@ def render_sidebar(pipeline: ProcessingPipeline) -> None:
     with st.sidebar:
         st.header("System status")
 
-        if SETTINGS.ai_enabled:
-            st.success(f"Azure OpenAI: {SETTINGS.azure_openai.deployment}")
+        st.success("Rule engine: active (first stage, no data leaves this machine)")
+
+        if pipeline.ai_enabled:
+            st.success(f"LLM fallback: {pipeline.llm_name}")
         else:
-            st.warning("Azure OpenAI not configured - keyword fallback active")
+            st.warning("No LLM fallback - unresolved documents go to review")
 
         if SETTINGS.ocr_enabled:
-            st.success(f"Document Intelligence: {SETTINGS.document_intelligence.model_id}")
+            st.success(f"OCR: Document Intelligence ({SETTINGS.document_intelligence.model_id})")
         else:
-            st.warning("Document Intelligence not configured - OCR limited")
+            st.info("OCR: local only (tesseract, if installed)")
 
         st.caption(
             f"Confidence threshold: **{SETTINGS.confidence_threshold:.0%}** - anything below is "
-            "parked in `data/review`."
+            "parked in `data/review`. The rule engine only exceeds it with hard evidence "
+            "(verified passport MRZ, or every field read from a labelled anchor)."
         )
 
         st.divider()
@@ -223,6 +226,10 @@ def render_document_card(pipeline: ProcessingPipeline, document: ProcessedDocume
                 st.info("No preview available")
             st.metric("Confidence", f"{document.result.confidence:.0%}")
             st.caption(f"Extraction source: {document.result.source}")
+            if document.result.evidence:
+                with st.expander("Why these values?"):
+                    for item in document.result.evidence:
+                        st.caption(f"- {item}")
             if document.result.notes:
                 st.caption(document.result.notes)
             if document.is_exported and document.exported_path:

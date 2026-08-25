@@ -18,11 +18,9 @@ The module exposes three things:
 
 from __future__ import annotations
 
-import json
 import re
-import time
-from dataclasses import dataclass
-from pathlib import Path
+from datetime import datetime
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from config import SETTINGS, Settings, get_logger
@@ -401,8 +399,10 @@ class ExtractionResult:
     dependent_name: str = ""       # given name of the child (naming rule)
     child_index: int | None = None  # "child 1", "child 2", ...
     period: str = ""               # payslip period, YYYY-MM
-    source: str = "heuristic"      # "azure_openai" | "heuristic" | "manual"
+    source: str = "rules"          # "rules" | "ollama" | "azure_openai" | "manual"
     notes: str = ""
+    #: Why the values are what they are - shown in the review screen.
+    evidence: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Return the mandatory extraction schema (plus naming extras)."""
@@ -486,24 +486,12 @@ class ClassifiedSegment:
 
 
 # --------------------------------------------------------------------------- #
-# Heuristic engine (deterministic fallback, no cloud calls)
+# Rule engine (deterministic, no model involved)
 # --------------------------------------------------------------------------- #
+#: Machine readable zone of a passport (TD3): two lines of 44 characters.
 _MRZ_LINE1 = re.compile(r"P[<A-Z][A-Z<]{3}([A-Z]+(?:<[A-Z]+)*)<<([A-Z]+(?:<[A-Z]+)*)")
-_MRZ_LINE2 = re.compile(r"[A-Z0-9<]{9}\d[A-Z<]{3}\d{6}\d[MFX<](\d{6})\d")
-
-_NAME_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("last_name", re.compile(
-        r"(?:surname|family\s*name|last\s*name|name\s*/\s*surname|nachname|familienname)"
-        r"\s*[:\-/]?\s*([A-ZÄÖÜ][\w'\-äöüß]+(?:\s+[A-ZÄÖÜ][\w'\-äöüß]+)?)", re.IGNORECASE)),
-    ("first_name", re.compile(
-        r"(?:given\s*names?|first\s*name|forename|vorname[n]?)"
-        r"\s*[:\-/]?\s*([A-ZÄÖÜ][\w'\-äöüß]+(?:\s+[A-ZÄÖÜ][\w'\-äöüß]+)?)", re.IGNORECASE)),
-    ("company", re.compile(
-        r"(?:employer|company|arbeitgeber|firma|unternehmen|host\s*company)"
-        r"\s*[:\-]?\s*([A-Z0-9ÄÖÜ][\w&.,'\-äöüß ]{2,45})", re.IGNORECASE)),
-    ("city", re.compile(
-        r"(?:city|town|stadt|wohnort|ort\s*der\s*anmeldung|gemeinde|municipality)"
-        r"\s*[:\-]?\s*([A-ZÄÖÜ][\w'\-äöüß]+(?:\s[A-ZÄÖÜ][\w'\-äöüß]+)?)", re.IGNORECASE)),
+_MRZ_LINE2 = re.compile(
+    r"([A-Z0-9<]{9})(\d)([A-Z<]{3})(\d{6})(\d)([MFX<])(\d{6})(\d)([A-Z0-9<]{14})(\d)(\d)"
 )
 
 #: Words that belong to the NEXT field label and must never end up in a value
@@ -515,8 +503,78 @@ _LABEL_STOP_WORDS: frozenset[str] = frozenset({
     "sex", "geschlecht", "birth", "geburt", "geburtsdatum", "place", "ort",
     "employer", "arbeitgeber", "company", "firma", "city", "stadt", "wohnort",
     "abrechnungsmonat", "abrechnungszeitraum", "type", "code", "authority",
-    "passport", "issue", "expiry", "valid", "no", "nr", "number",
+    "passport", "issue", "expiry", "valid", "no", "nr", "number", "geboren",
+    "und", "and", "wohnhaft", "vertreten", "vater", "father", "mutter", "mother",
+    "eltern", "parents", "kind", "child", "wife", "husband", "ehefrau", "ehemann",
+    "standesamt", "registrar", "born", "geb",
 })
+
+_NAME_CHARS = r"[A-ZÄÖÜ][\w'\-äöüßéèêáàâç]*"
+#: Horizontal whitespace only: a person name never spans two lines, so the
+#: capture must stop at the line break instead of swallowing the next label.
+_H = r"[^\S\r\n]"
+
+#: Generic labelled patterns, tried for every document type.
+_GENERIC_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("last_name", re.compile(
+        r"(?:surname|family\s*name|last\s*name|name\s*/\s*surname|nachname|familienname)"
+        rf"{_H}*[:\-/]?{_H}*({_NAME_CHARS}(?:{_H}+{_NAME_CHARS})?)", re.IGNORECASE)),
+    ("first_name", re.compile(
+        r"(?:given\s*names?|first\s*name|forename|vorname[n]?)"
+        rf"{_H}*[:\-/]?{_H}*({_NAME_CHARS}(?:{_H}+{_NAME_CHARS})?)", re.IGNORECASE)),
+    ("company", re.compile(
+        r"(?:employer|company|arbeitgeber|firma|unternehmen|host\s*company)"
+        r"\s*[:\-]?\s*([A-Z0-9ÄÖÜ][\w&.,'\-äöüß ]{2,45})", re.IGNORECASE)),
+    ("city", re.compile(
+        r"(?:city|town|stadt|wohnort|ort\s*der\s*anmeldung|gemeinde|municipality)"
+        rf"{_H}*[:\-]?{_H}*({_NAME_CHARS}(?:{_H}{_NAME_CHARS})?)", re.IGNORECASE)),
+)
+
+#: Per-document-type anchors. These are the standardised forms where a regex is
+#: as reliable as a language model - and, unlike a model, verifiable.
+_TYPE_PATTERNS: dict[str, tuple[tuple[str, re.Pattern[str]], ...]] = {
+    "09_marriage_certificate": (
+        ("full_name", re.compile(
+            rf"(?:husband|ehemann|spouse\s*1|partner\s*1){_H}*[:\-]?{_H}*({_NAME_CHARS}(?:{_H}+{_NAME_CHARS}){{0,2}})",
+            re.IGNORECASE)),
+        ("city", re.compile(rf"standesamt{_H}+({_NAME_CHARS}(?:{_H}{_NAME_CHARS})?)", re.IGNORECASE)),
+    ),
+    "10_birth_certificate": (
+        ("dependent_name", re.compile(
+            rf"(?:name\s*(?:des\s*kindes|of\s*the\s*child)|kind|child){_H}*[:\-/]?{_H}*({_NAME_CHARS}(?:{_H}+{_NAME_CHARS})?)",
+            re.IGNORECASE)),
+        ("full_name", re.compile(
+            rf"(?:vater|father){_H}*[:\-]?{_H}*({_NAME_CHARS}(?:{_H}+{_NAME_CHARS}){{0,2}})", re.IGNORECASE)),
+        ("city", re.compile(rf"standesamt{_H}+({_NAME_CHARS}(?:{_H}{_NAME_CHARS})?)", re.IGNORECASE)),
+    ),
+    "12_payslip": (
+        ("period", re.compile(
+            r"(?:abrechnungsmonat|abrechnungszeitraum|pay\s*period|lohnmonat)\s*[:\-]?\s*"
+            r"(\d{1,2}\s?[./-]\s?\d{4}|\d{4}\s?-\s?\d{1,2})", re.IGNORECASE)),
+    ),
+    "04_employment_contract": (
+        # "zwischen <Firma> und <Name>" - the standard German contract opening.
+        ("company", re.compile(
+            r"zwischen\s+(?:der\s+|dem\s+)?([A-Z0-9ÄÖÜ][\w&.,'\-äöüß ]{2,50}?)\s+und\b", re.IGNORECASE)),
+    ),
+    "05_assignment_letter": (
+        ("company", re.compile(
+            r"(?:host\s*company|gastunternehmen|aufnehmendes\s*unternehmen)\s*[:\-]?\s*"
+            r"([A-Z0-9ÄÖÜ][\w&.,'\-äöüß ]{2,45})", re.IGNORECASE)),
+    ),
+}
+
+#: City anchors for the town hall documents: the line after a German postcode.
+_POSTCODE_CITY = re.compile(rf"\b\d{{5}}\s+({_NAME_CHARS}(?:[- ]{_NAME_CHARS})?)")
+
+_EXPIRY_HINTS: tuple[str, ...] = (
+    "date of expiry", "valid until", "valid till", "expiry date", "expires",
+    "gültig bis", "gultig bis", "gueltig bis", "befristet bis", "date d'expiration",
+)
+
+_PERIOD_HINTS: tuple[str, ...] = (
+    "abrechnungsmonat", "abrechnungszeitraum", "pay period", "period", "monat", "month",
+)
 
 
 def _trim_label_bleed(value: str) -> str:
@@ -527,14 +585,120 @@ def _trim_label_bleed(value: str) -> str:
     return " ".join(words)
 
 
-_EXPIRY_HINTS: tuple[str, ...] = (
-    "date of expiry", "valid until", "valid till", "expiry date", "expires",
-    "gültig bis", "gultig bis", "gueltig bis", "befristet bis", "date d'expiration",
-)
+def split_full_name(value: str) -> tuple[str, str]:
+    """Split a full name into ``(first_name, last_name)``.
 
-_PERIOD_HINTS: tuple[str, ...] = (
-    "abrechnungsmonat", "abrechnungszeitraum", "pay period", "period", "monat", "month",
-)
+    Handles both ``"John Smith"`` and the German ``"Smith, John"`` order.
+    """
+    cleaned = _trim_label_bleed(value.strip())
+    if not cleaned:
+        return "", ""
+    if "," in cleaned:
+        last, _, first = cleaned.partition(",")
+        return first.strip().split(" ")[0], last.strip()
+    parts = cleaned.split()
+    if len(parts) == 1:
+        return "", parts[0]
+    return parts[0], parts[-1]
+
+
+# --------------------------------------------------------------------------- #
+# Passport MRZ with check digit verification
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class MrzData:
+    """Result of reading a passport machine readable zone."""
+
+    surname: str
+    given_name: str
+    document_number: str
+    nationality: str
+    expiry_date: str          # DD.MM.YYYY
+    birth_date: str           # DD.MM.YYYY
+    checks: dict[str, bool] = field(default_factory=dict)
+
+    @property
+    def is_verified(self) -> bool:
+        """True when every check digit of the MRZ matched.
+
+        A verified MRZ is *arithmetically* confirmed, not guessed - which is
+        exactly why the rule engine may trust it more than a model's reading.
+        """
+        return bool(self.checks) and all(self.checks.values())
+
+
+class MrzParser:
+    """Parses and verifies the TD3 machine readable zone of a passport."""
+
+    _WEIGHTS = (7, 3, 1)
+
+    @classmethod
+    def check_digit(cls, value: str) -> int:
+        """Compute the ICAO 9303 check digit of *value*."""
+        total = 0
+        for index, char in enumerate(value):
+            if char.isdigit():
+                digit = int(char)
+            elif char == "<":
+                digit = 0
+            elif char.isalpha():
+                digit = ord(char.upper()) - 55  # A=10 ... Z=35
+            else:
+                digit = 0
+            total += digit * cls._WEIGHTS[index % 3]
+        return total % 10
+
+    @classmethod
+    def parse(cls, text: str) -> MrzData | None:
+        """Extract and verify the MRZ from *text*, or return ``None``."""
+        compact = re.sub(r"[ \t]", "", text.upper())
+        line1 = _MRZ_LINE1.search(compact)
+        if not line1:
+            return None
+
+        surname = line1.group(1).replace("<", " ").strip()
+        given = line1.group(2).replace("<", " ").strip()
+
+        line2 = _MRZ_LINE2.search(compact[line1.end():]) or _MRZ_LINE2.search(compact)
+        if not line2:
+            return MrzData(
+                surname=surname.title(),
+                given_name=given.split(" ")[0].title() if given else "",
+                document_number="", nationality="", expiry_date="", birth_date="",
+            )
+
+        number, number_cd, nationality, birth, birth_cd, _sex, expiry, expiry_cd, personal, personal_cd, composite_cd = (
+            line2.groups()
+        )
+        checks = {
+            "document_number": cls.check_digit(number) == int(number_cd),
+            "birth_date": cls.check_digit(birth) == int(birth_cd),
+            "expiry_date": cls.check_digit(expiry) == int(expiry_cd),
+            "composite": cls.check_digit(
+                f"{number}{number_cd}{birth}{birth_cd}{expiry}{expiry_cd}{personal}{personal_cd}"
+            ) == int(composite_cd),
+        }
+        return MrzData(
+            surname=surname.title(),
+            given_name=given.split(" ")[0].title() if given else "",
+            document_number=number.replace("<", ""),
+            nationality=nationality.replace("<", ""),
+            expiry_date=cls._mrz_date(expiry, future=True),
+            birth_date=cls._mrz_date(birth, future=False),
+            checks=checks,
+        )
+
+    @staticmethod
+    def _mrz_date(raw: str, future: bool) -> str:
+        """Convert a ``YYMMDD`` MRZ date into ``DD.MM.YYYY``."""
+        try:
+            year, month, day = int(raw[0:2]), int(raw[2:4]), int(raw[4:6])
+            if not (1 <= month <= 12 and 1 <= day <= 31):
+                return ""
+        except (ValueError, IndexError):
+            return ""
+        century = 2000 if future or year <= (datetime.now().year % 100) else 1900
+        return f"{day:02d}.{month:02d}.{century + year:04d}"
 
 
 class KeywordClassifier:
@@ -563,8 +727,8 @@ class KeywordClassifier:
     def classify(self, text: str, cap: float) -> tuple[str, float]:
         """Return the best matching type key and a capped confidence value.
 
-        Heuristic results can never exceed *cap* (default 0.55) so that they
-        always land in the manual review queue.
+        The confidence returned here reflects the *keyword* evidence only;
+        :class:`RuleFieldExtractor` raises it when hard anchors are found.
         """
         scores = self.score(text)
         if not scores:
@@ -580,53 +744,100 @@ class KeywordClassifier:
         return best_key, round(min(cap, max(0.15, confidence)), 3)
 
 
-class HeuristicFieldExtractor:
-    """Regex/MRZ based extraction used when Azure OpenAI is not available."""
+class RuleFieldExtractor:
+    """Extracts the mandatory fields with verifiable rules.
 
-    def extract(self, text: str, document_type: str, confidence: float) -> ExtractionResult:
-        """Extract the mandatory fields from *text* as well as regexes allow."""
-        result = ExtractionResult(document_type=document_type, confidence=confidence, source="heuristic")
+    Order of evidence, strongest first:
+
+    1. a passport MRZ whose check digits all match,
+    2. an anchor defined for this exact document type,
+    3. a generic labelled field (``Surname:``, ``Arbeitgeber:``),
+    4. a positional guess (a date near "valid until").
+
+    The confidence reflects that order, and every match is recorded in
+    ``result.evidence`` so the review screen can show *why* a value is there.
+    """
+
+    def __init__(self, settings: Settings = SETTINGS) -> None:
+        self._settings = settings
+
+    def extract(self, text: str, document_type: str, keyword_confidence: float) -> ExtractionResult:
+        """Extract every field the rules can reach from *text*."""
         spec = get_spec(document_type)
+        result = ExtractionResult(
+            document_type=document_type, confidence=keyword_confidence, source="rules"
+        )
 
-        self._apply_mrz(text, result)
-        self._apply_labels(text, result)
+        mrz = self._apply_mrz(text, result)
+        self._apply_type_patterns(text, result, spec)
+        self._apply_generic_patterns(text, result)
+        self._apply_positional(text, result, spec)
 
-        if spec.requires_validity and not result.valid_until:
-            result.valid_until = self._find_expiry(text)
-        if spec.requires_period and not result.period:
-            result.period = self._find_period(text)
         if spec.relationship_in_label:
             result.relationship = "spouse" if spec.key.endswith("spouse") else "child"
+        if result.dependent_name and not result.relationship:
+            result.relationship = "child"
 
-        result.notes = "extracted without AI (keyword/regex engine)"
+        result.confidence = self._confidence(result, spec, keyword_confidence, mrz)
         return result
 
-    # -- internals --------------------------------------------------------- #
-    def _apply_mrz(self, text: str, result: ExtractionResult) -> None:
-        """Read names and expiry date from a passport machine readable zone."""
-        compact = text.replace(" ", "")
-        match = _MRZ_LINE1.search(compact)
-        if match:
-            surname = match.group(1).replace("<", " ").strip()
-            given = match.group(2).replace("<", " ").strip()
-            if surname:
-                result.last_name = surname.title()
-            if given:
-                result.first_name = given.split(" ")[0].title()
-            logger.debug("MRZ names detected: %s, %s", result.last_name, result.first_name)
+    # -- evidence sources -------------------------------------------------- #
+    def _apply_mrz(self, text: str, result: ExtractionResult) -> MrzData | None:
+        """Read names and expiry from a passport MRZ (with check digits)."""
+        mrz = MrzParser.parse(text)
+        if not mrz:
+            return None
+        if mrz.surname:
+            result.last_name = mrz.surname
+        if mrz.given_name:
+            result.first_name = mrz.given_name
+        if mrz.expiry_date:
+            result.valid_until = mrz.expiry_date
+        if mrz.is_verified:
+            result.evidence.append("MRZ verified (all check digits match)")
+            logger.info(
+                "MRZ verified: %s %s, expires %s", mrz.given_name, mrz.surname, mrz.expiry_date
+            )
+        else:
+            failed = [name for name, ok in mrz.checks.items() if not ok]
+            result.evidence.append(
+                "MRZ read" + (f", failed checks: {', '.join(failed)}" if failed else ", unverified")
+            )
+        return mrz
 
-        expiry = _MRZ_LINE2.search(compact)
-        if expiry:
-            raw = expiry.group(1)  # YYMMDD
-            try:
-                year = 2000 + int(raw[0:2])
-                result.valid_until = f"{raw[4:6]}.{raw[2:4]}.{year}"
-            except (ValueError, IndexError):  # pragma: no cover - malformed MRZ
-                pass
+    def _apply_type_patterns(self, text: str, result: ExtractionResult, spec: DocumentTypeSpec) -> None:
+        """Apply the anchors defined for this document type."""
+        for field_name, pattern in _TYPE_PATTERNS.get(spec.key, ()):  # type: ignore[arg-type]
+            match = pattern.search(text)
+            if not match:
+                continue
+            value = _trim_label_bleed(match.group(1).strip())
+            if not value:
+                continue
+            if field_name == "full_name":
+                first, last = split_full_name(value)
+                if last and not result.last_name:
+                    result.last_name = last
+                    result.evidence.append(f"last_name from {spec.key} anchor")
+                if first and not result.first_name:
+                    result.first_name = first
+                    result.evidence.append(f"first_name from {spec.key} anchor")
+                continue
+            if field_name == "dependent_name":
+                value = split_full_name(value)[0] or value
+            if not getattr(result, field_name, ""):
+                setattr(result, field_name, value)
+                result.evidence.append(f"{field_name} from {spec.key} anchor")
 
-    def _apply_labels(self, text: str, result: ExtractionResult) -> None:
-        """Read labelled fields such as ``Surname: ...`` from the text."""
-        for field_name, pattern in _NAME_PATTERNS:
+        if spec.requires_city and not result.city:
+            postcode = _POSTCODE_CITY.search(text)
+            if postcode:
+                result.city = _trim_label_bleed(postcode.group(1))
+                result.evidence.append("city from postal code line")
+
+    def _apply_generic_patterns(self, text: str, result: ExtractionResult) -> None:
+        """Apply the labelled patterns that work across document types."""
+        for field_name, pattern in _GENERIC_PATTERNS:
             if getattr(result, field_name):
                 continue
             match = pattern.search(text)
@@ -635,24 +846,97 @@ class HeuristicFieldExtractor:
             value = _trim_label_bleed(match.group(1).strip())
             if value:
                 setattr(result, field_name, value)
+                result.evidence.append(f"{field_name} from label")
 
-    def _find_expiry(self, text: str) -> str:
-        """Find the most plausible validity date in *text*."""
+    def _apply_positional(self, text: str, result: ExtractionResult, spec: DocumentTypeSpec) -> None:
+        """Dates next to an explicit hint (an anchor), or a last-resort guess."""
+        if spec.requires_validity and not result.valid_until:
+            found, from_label = self._find_expiry(text)
+            if found:
+                result.valid_until = found
+                result.evidence.append(
+                    "valid_until from label" if from_label else "valid_until guessed from context"
+                )
+        if spec.requires_period and not result.period:
+            found, from_label = self._find_period(text)
+            if found:
+                result.period = found
+                result.evidence.append(
+                    "period from label" if from_label else "period guessed from context"
+                )
+
+    # -- confidence -------------------------------------------------------- #
+    def _confidence(
+        self,
+        result: ExtractionResult,
+        spec: DocumentTypeSpec,
+        keyword_confidence: float,
+        mrz: MrzData | None,
+    ) -> float:
+        """Turn the collected evidence into an honest confidence value.
+
+        A guessed value never lifts the result over the review threshold, and a
+        missing company always keeps it below it - the file name would carry
+        ``UNKNOWN`` otherwise.
+        """
+        threshold = self._settings.confidence_threshold
+        guessed = any("guessed" in item for item in result.evidence)
+        anchored = {
+            item.split(" ")[0] for item in result.evidence if " from " in item
+        }
+
+        if mrz and mrz.is_verified:
+            confidence = 0.95
+        elif self._all_required_anchored(result, spec, anchored) and not guessed:
+            confidence = self._settings.rule_trusted_confidence
+        else:
+            confidence = min(keyword_confidence, self._settings.heuristic_confidence_cap)
+
+        if spec.key == UNKNOWN_TYPE_KEY:
+            confidence = min(confidence, 0.30)
+        if not result.company or not result.first_name or not result.last_name:
+            # Missing pieces of the file name are always a review case.
+            confidence = min(confidence, threshold - 0.02)
+        if guessed:
+            confidence = min(confidence, threshold - 0.02)
+        return round(max(0.05, confidence), 3)
+
+    @staticmethod
+    def _all_required_anchored(
+        result: ExtractionResult, spec: DocumentTypeSpec, anchored: set[str]
+    ) -> bool:
+        """True when every field the file name needs came from a real anchor."""
+        required = {"first_name", "last_name", "company"}
+        if spec.requires_validity:
+            required.add("valid_until")
+        if spec.requires_period:
+            required.add("period")
+        if spec.requires_city:
+            required.add("city")
+        return required.issubset(anchored) and all(getattr(result, name, "") for name in required)
+
+    # -- helpers ----------------------------------------------------------- #
+    def _find_expiry(self, text: str) -> tuple[str, bool]:
+        """Return ``(date, from_label)`` for the most plausible validity date.
+
+        ``from_label`` is True when the date sits next to an explicit hint such
+        as "valid until" or "gültig bis"; that counts as a real anchor. The
+        fallback - the latest future date anywhere in the document - is a guess
+        and keeps the result below the review threshold.
+        """
         lowered = text.lower()
         for hint in _EXPIRY_HINTS:
             index = lowered.find(hint)
             if index == -1:
                 continue
-            window = text[index : index + 120]
-            dates = find_dates(window)
+            dates = find_dates(text[index : index + 120])
             if dates:
-                return normalise_date_string(dates[0])
-        # Fall back to the latest future date found anywhere in the document.
+                return normalise_date_string(dates[0]), True
         future = [d for d in find_dates(text) if d.year >= 2000]
-        return normalise_date_string(max(future)) if future else ""
+        return (normalise_date_string(max(future)), False) if future else ("", False)
 
-    def _find_period(self, text: str) -> str:
-        """Find the payslip period (``YYYY-MM``)."""
+    def _find_period(self, text: str) -> tuple[str, bool]:
+        """Return ``(period, from_label)`` for the payslip period (``YYYY-MM``)."""
         lowered = text.lower()
         for hint in _PERIOD_HINTS:
             index = lowered.find(hint)
@@ -660,22 +944,27 @@ class HeuristicFieldExtractor:
                 continue
             period = normalise_period(text[index : index + 60])
             if period:
-                return period
+                return period, True
         dates = find_dates(text)
-        return normalise_period(dates[0]) if dates else ""
+        return (normalise_period(dates[0]), False) if dates else ("", False)
 
 
-class HeuristicSegmenter:
-    """Detects document boundaries inside a combined PDF without AI.
+class RuleSegmenter:
+    """Detects document boundaries inside a combined PDF without any model.
 
     Each page is scored independently; consecutive pages that resolve to the
     same type (or that carry no strong signal of their own) are merged into one
     segment, which mirrors how combined client PDFs are usually assembled.
     """
 
-    def __init__(self, classifier: KeywordClassifier | None = None, settings: Settings = SETTINGS) -> None:
+    def __init__(
+        self,
+        classifier: KeywordClassifier | None = None,
+        extractor: RuleFieldExtractor | None = None,
+        settings: Settings = SETTINGS,
+    ) -> None:
         self._classifier = classifier or KeywordClassifier()
-        self._extractor = HeuristicFieldExtractor()
+        self._extractor = extractor or RuleFieldExtractor(settings)
         self._settings = settings
 
     def segment(self, document: DocumentText) -> list[ClassifiedSegment]:
@@ -684,10 +973,9 @@ class HeuristicSegmenter:
         if not document.pages:
             return []
 
-        page_types: list[tuple[int, str, float]] = []
-        for page in document.pages:
-            key, confidence = self._classifier.classify(page.text, cap)
-            page_types.append((page.number, key, confidence))
+        page_types = [
+            (page.number, *self._classifier.classify(page.text, cap)) for page in document.pages
+        ]
 
         # Pages without their own signal continue the previous document.
         ranges: list[list[Any]] = []
@@ -711,246 +999,215 @@ class HeuristicSegmenter:
             segments.append(ClassifiedSegment(start_page=start, end_page=end, result=result))
 
         logger.info(
-            "Heuristic segmentation of %s produced %d document(s): %s",
+            "Rule engine segmented %s into %d document(s): %s",
             document.path.name, len(segments),
-            ", ".join(f"{s.page_label}={s.result.document_type}" for s in segments),
+            ", ".join(
+                f"{s.page_label}={s.result.document_type} ({s.result.confidence:.0%})"
+                for s in segments
+            ),
         )
         return segments
 
 
-# --------------------------------------------------------------------------- #
-# Azure OpenAI engine
-# --------------------------------------------------------------------------- #
-class AzureOpenAIExtractor:
-    """Classifies and extracts fields with an Azure OpenAI chat deployment."""
-
-    _DEFAULT_PROMPT_NAME = "document_classifier.txt"
-
-    def __init__(self, settings: Settings = SETTINGS) -> None:
-        self._settings = settings
-        self._config = settings.azure_openai
-        self._client: Any | None = None
-        self._prompt: str | None = None
-
-    @property
-    def is_available(self) -> bool:
-        """True when Azure OpenAI credentials are configured."""
-        return self._config.is_configured
-
-    # -- prompt ------------------------------------------------------------ #
-    def _system_prompt(self) -> str:
-        """Load (and cache) the system prompt from ``prompts/``."""
-        if self._prompt is not None:
-            return self._prompt
-        prompt_path: Path = self._settings.paths.prompts / self._DEFAULT_PROMPT_NAME
-        try:
-            self._prompt = prompt_path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise ClassificationError(f"Prompt file missing: {prompt_path} ({exc})") from exc
-        self._prompt = self._prompt.replace("{{DOCUMENT_TYPES}}", self._catalogue_block())
-        return self._prompt
-
-    @staticmethod
-    def _catalogue_block() -> str:
-        """Render the allowed document types for the prompt."""
-        lines = []
-        for key, spec in sorted(DOCUMENT_TYPES.items(), key=lambda item: item[1].label_template):
-            extras = []
-            if spec.requires_validity:
-                extras.append("needs valid_until")
-            if spec.requires_period:
-                extras.append("needs period (YYYY-MM)")
-            if spec.requires_city:
-                extras.append("needs city")
-            suffix = f" [{', '.join(extras)}]" if extras else ""
-            lines.append(f'- "{key}": {spec.description}{suffix}')
-        return "\n".join(lines)
-
-    # -- client ------------------------------------------------------------ #
-    def _get_client(self) -> Any:
-        """Create (once) and return the Azure OpenAI client."""
-        if self._client is not None:
-            return self._client
-        try:
-            from openai import AzureOpenAI
-        except ImportError as exc:  # pragma: no cover - dependency missing
-            raise ClassificationError(
-                "openai is not installed - run 'pip install -r requirements.txt'"
-            ) from exc
-
-        self._client = AzureOpenAI(
-            api_key=self._config.api_key,
-            azure_endpoint=self._config.endpoint,
-            api_version=self._config.api_version,
-            timeout=self._config.timeout,
-        )
-        logger.info("Azure OpenAI client initialised (deployment: %s)", self._config.deployment)
-        return self._client
-
-    # -- public API -------------------------------------------------------- #
-    def analyze(self, document: DocumentText) -> list[ClassifiedSegment]:
-        """Return one :class:`ClassifiedSegment` per logical document.
-
-        Raises:
-            ClassificationError: When the model cannot be reached or returns an
-                unusable answer after all retries.
-        """
-        if not self.is_available:
-            raise ClassificationError("Azure OpenAI is not configured")
-        if document.is_empty:
-            raise ClassificationError("document contains no text to classify")
-
-        payload = self._call_model(self._build_user_message(document))
-        documents = payload.get("documents")
-        if not isinstance(documents, list) or not documents:
-            raise ClassificationError("model returned no documents")
-
-        segments: list[ClassifiedSegment] = []
-        for entry in documents:
-            if not isinstance(entry, Mapping):
-                continue
-            start = self._coerce_page(entry.get("start_page"), 1, document.page_count)
-            end = self._coerce_page(entry.get("end_page"), start, document.page_count)
-            if end < start:
-                start, end = end, start
-            result = ExtractionResult.from_payload(entry, source="azure_openai")
-            segments.append(ClassifiedSegment(start_page=start, end_page=end, result=result))
-
-        if not segments:
-            raise ClassificationError("model answer could not be mapped to page ranges")
-        logger.info(
-            "Azure OpenAI detected %d document(s) in %s: %s",
-            len(segments), document.path.name,
-            ", ".join(f"{s.page_label}={s.result.document_type} ({s.result.confidence:.0%})" for s in segments),
-        )
-        return segments
-
-    # -- internals --------------------------------------------------------- #
-    @staticmethod
-    def _coerce_page(value: Any, default: int, maximum: int) -> int:
-        """Clamp a page number returned by the model into the valid range."""
-        try:
-            page = int(value)
-        except (TypeError, ValueError):
-            page = default
-        return max(1, min(page, max(maximum, 1)))
-
-    def _build_user_message(self, document: DocumentText) -> str:
-        """Render the user message: page-marked document text."""
-        return (
-            f"File name: {document.path.name}\n"
-            f"Total pages: {document.page_count}\n"
-            f"OCR used: {'yes' if document.ocr_used else 'no'}\n\n"
-            "Document text (page markers included):\n"
-            f"{document.snippet()}"
-        )
-
-    def _call_model(self, user_message: str, attempts: int = 3) -> dict[str, Any]:
-        """Call the chat deployment and return the parsed JSON answer."""
-        client = self._get_client()
-        last_error: Exception | None = None
-
-        for attempt in range(1, attempts + 1):
-            try:
-                response = client.chat.completions.create(
-                    model=self._config.deployment,
-                    messages=[
-                        {"role": "system", "content": self._system_prompt()},
-                        {"role": "user", "content": user_message},
-                    ],
-                    temperature=self._config.temperature,
-                    max_tokens=self._config.max_tokens,
-                    response_format={"type": "json_object"},
-                )
-                content = (response.choices[0].message.content or "").strip()
-                return self._parse_json(content)
-            except Exception as exc:  # network, rate limit, malformed JSON, ...
-                last_error = exc
-                logger.warning("Azure OpenAI call failed (attempt %d/%d): %s", attempt, attempts, exc)
-                if attempt < attempts:
-                    time.sleep(min(2 ** attempt, 8))
-
-        raise ClassificationError(f"Azure OpenAI request failed: {last_error}")
-
-    @staticmethod
-    def _parse_json(content: str) -> dict[str, Any]:
-        """Parse a JSON object out of the model answer (tolerates code fences)."""
-        if not content:
-            raise ClassificationError("empty model answer")
-        cleaned = content.strip()
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", cleaned).strip()
-        try:
-            payload = json.loads(cleaned)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-            if not match:
-                raise ClassificationError(f"model answer is not JSON: {cleaned[:200]}")
-            try:
-                payload = json.loads(match.group(0))
-            except json.JSONDecodeError as exc:
-                raise ClassificationError(f"model answer is not JSON: {exc}") from exc
-        if not isinstance(payload, dict):
-            raise ClassificationError("model answer is not a JSON object")
-        return payload
+#: Backwards compatible aliases (the classes were renamed when the rule engine
+#: was promoted from "fallback" to "first stage").
+HeuristicFieldExtractor = RuleFieldExtractor
+HeuristicSegmenter = RuleSegmenter
 
 
 # --------------------------------------------------------------------------- #
-# Facade
+# Facade: rules first, local LLM as the fallback
 # --------------------------------------------------------------------------- #
 class DocumentClassifier:
     """Turns the text of an uploaded PDF into classified page ranges.
 
-    Uses Azure OpenAI when configured and falls back to the deterministic
-    keyword engine on any failure, so the application always produces a result
-    (a low-confidence one that lands in the review queue).
+    Strategy (``RULES_FIRST=true``, the default):
+
+    1. The deterministic rule engine classifies, splits and extracts. Documents
+       it resolves with hard evidence (a checksum-verified passport MRZ, or
+       every file name field read from a labelled anchor) are done here - no
+       model is asked, nothing leaves the machine, and the result is
+       reproducible.
+    2. Only the segments the rules could *not* resolve are handed to the LLM
+       fallback (a local Ollama model by default, Azure OpenAI when configured
+       that way). If the page grouping itself looks doubtful, the whole
+       document is re-analysed by the model.
+    3. Verified rule data always wins over model output when both exist.
+
+    With no LLM available the pipeline still works: the weak documents simply
+    stay below the confidence threshold and land in the review queue.
     """
 
     def __init__(
         self,
         settings: Settings = SETTINGS,
-        ai_extractor: AzureOpenAIExtractor | None = None,
-        segmenter: HeuristicSegmenter | None = None,
+        llm_extractor: Any | None = None,
+        segmenter: RuleSegmenter | None = None,
     ) -> None:
         self._settings = settings
-        self._ai = ai_extractor or AzureOpenAIExtractor(settings)
-        self._heuristics = segmenter or HeuristicSegmenter(settings=settings)
+        self._rules = segmenter or RuleSegmenter(settings=settings)
+        if llm_extractor is None:
+            # Imported lazily: modules.llm_providers imports this module.
+            from modules.llm_providers import build_llm_extractor
 
+            llm_extractor = build_llm_extractor(settings)
+        self._llm = llm_extractor
+
+    # -- properties -------------------------------------------------------- #
     @property
     def ai_enabled(self) -> bool:
-        """True when the AI backend is configured."""
-        return self._ai.is_available
+        """True when an LLM fallback is available."""
+        return bool(self._llm and self._llm.is_available)
 
+    @property
+    def llm_name(self) -> str:
+        """Name of the active fallback backend, or ``"rules only"``."""
+        return self._llm.display_name if self.ai_enabled else "rules only"
+
+    # -- public API -------------------------------------------------------- #
     def analyze(self, document: DocumentText) -> list[ClassifiedSegment]:
         """Classify *document* and return its segments (never empty)."""
-        segments: list[ClassifiedSegment] = []
-
-        if self._ai.is_available:
+        if not self._settings.rules_first and self.ai_enabled:
+            # Model-first mode: kept for comparison and for very messy scans.
             try:
-                segments = self._ai.analyze(document)
+                return self._normalise(self._llm.analyze(document), document)
             except ClassificationError as exc:
-                logger.error("AI classification failed for %s: %s", document.path.name, exc)
-            except Exception as exc:  # defensive: SDK surprises must not crash a batch
-                logger.exception("Unexpected AI failure for %s: %s", document.path.name, exc)
-        else:
-            logger.warning(
-                "Azure OpenAI not configured - using the keyword engine for %s", document.path.name
-            )
+                logger.error("LLM-first analysis failed for %s: %s", document.path.name, exc)
 
+        segments = self._rules.segment(document)
         if not segments:
-            segments = self._heuristics.segment(document)
-        if not segments:  # completely empty/unreadable PDF
-            result = ExtractionResult(
-                document_type=UNKNOWN_TYPE_KEY,
-                confidence=0.0,
-                notes="no text could be extracted",
-            )
-            segments = [ClassifiedSegment(1, max(document.page_count, 1), result)]
+            segments = [
+                ClassifiedSegment(
+                    1,
+                    max(document.page_count, 1),
+                    ExtractionResult(
+                        document_type=UNKNOWN_TYPE_KEY,
+                        confidence=0.0,
+                        notes="no text could be extracted",
+                    ),
+                )
+            ]
 
+        weak = [segment for segment in segments if self._needs_help(segment)]
+        if not weak:
+            logger.info(
+                "%s fully resolved by the rule engine - no model call needed", document.path.name
+            )
+            return self._normalise(segments, document)
+
+        if not self.ai_enabled:
+            logger.info(
+                "%d document(s) of %s need review: no LLM fallback configured",
+                len(weak), document.path.name,
+            )
+            return self._normalise(segments, document)
+
+        if self._grouping_uncertain(segments):
+            improved = self._retry_whole_document(document, segments)
+            if improved is not None:
+                return self._normalise(improved, document)
+
+        for segment in weak:
+            self._improve_segment(segment, document)
         return self._normalise(segments, document)
 
-    # -- internals --------------------------------------------------------- #
-    def _normalise(self, segments: list[ClassifiedSegment], document: DocumentText) -> list[ClassifiedSegment]:
+    # -- fallback strategy ------------------------------------------------- #
+    def _needs_help(self, segment: ClassifiedSegment) -> bool:
+        """True when the rules did not resolve this segment convincingly."""
+        result = segment.result
+        if result.document_type == UNKNOWN_TYPE_KEY:
+            return True
+        if result.confidence < self._settings.confidence_threshold:
+            return True
+        spec = get_spec(result.document_type)
+        missing = not (result.first_name and result.last_name and result.company)
+        if spec.requires_validity and not result.valid_until:
+            missing = True
+        if spec.requires_period and not result.period:
+            missing = True
+        if spec.requires_city and not result.city:
+            missing = True
+        return missing
+
+    def _grouping_uncertain(self, segments: Sequence[ClassifiedSegment]) -> bool:
+        """True when the page grouping itself should be re-checked by the model."""
+        return any(segment.result.document_type == UNKNOWN_TYPE_KEY for segment in segments)
+
+    def _retry_whole_document(
+        self, document: DocumentText, rule_segments: Sequence[ClassifiedSegment]
+    ) -> list[ClassifiedSegment] | None:
+        """Let the model re-segment the document, keeping verified rule data."""
+        try:
+            llm_segments = self._llm.analyze(document)
+        except ClassificationError as exc:
+            logger.error("LLM re-analysis failed for %s: %s", document.path.name, exc)
+            return None
+        except Exception as exc:  # defensive: a backend must not kill the batch
+            logger.exception("Unexpected LLM failure for %s: %s", document.path.name, exc)
+            return None
+
+        for llm_segment in llm_segments:
+            for rule_segment in rule_segments:
+                if not self._overlaps(llm_segment, rule_segment):
+                    continue
+                if self._is_verified(rule_segment.result):
+                    self._apply_verified(rule_segment.result, llm_segment.result)
+        return list(llm_segments)
+
+    def _improve_segment(self, segment: ClassifiedSegment, document: DocumentText) -> None:
+        """Ask the model about one weak segment and merge what it returns."""
+        text = document.text_for_range(segment.start_page, segment.end_page)
+        if not text.strip():
+            return
+        spec = get_spec(segment.result.document_type)
+        hint = spec.description if spec.key != UNKNOWN_TYPE_KEY else ""
+        improved = self._llm.analyze_single(text, segment.page_count, hint=hint)
+        if improved is None:
+            logger.info("LLM could not improve %s of %s", segment.page_label, document.path.name)
+            return
+
+        before = segment.result
+        improved.evidence = list(before.evidence) + [f"fields completed by {self._llm.display_name}"]
+        if self._is_verified(before):
+            self._apply_verified(before, improved)
+        # Keep rule values the model left empty.
+        for name in ("first_name", "last_name", "company", "city", "valid_until", "period"):
+            if not getattr(improved, name, "") and getattr(before, name, ""):
+                setattr(improved, name, getattr(before, name))
+        segment.result = improved
+        logger.info(
+            "%s of %s completed by %s (%s -> %s, %.0f%%)",
+            segment.page_label, document.path.name, self._llm.display_name,
+            before.document_type, improved.document_type, improved.confidence * 100,
+        )
+
+    # -- merge helpers ----------------------------------------------------- #
+    @staticmethod
+    def _overlaps(left: ClassifiedSegment, right: ClassifiedSegment) -> bool:
+        """True when two segments share at least one page."""
+        return left.start_page <= right.end_page and right.start_page <= left.end_page
+
+    @staticmethod
+    def _is_verified(result: ExtractionResult) -> bool:
+        """True when the rule engine verified this result arithmetically."""
+        return any("MRZ verified" in item for item in result.evidence)
+
+    @staticmethod
+    def _apply_verified(verified: ExtractionResult, target: ExtractionResult) -> None:
+        """Overwrite model output with checksum-verified rule data."""
+        target.document_type = verified.document_type
+        for name in ("first_name", "last_name", "valid_until"):
+            value = getattr(verified, name, "")
+            if value:
+                setattr(target, name, value)
+        target.evidence = list(dict.fromkeys(list(target.evidence) + list(verified.evidence)))
+        target.confidence = max(target.confidence, verified.confidence)
+        logger.debug("Verified rule data kept over model output for %s", verified.document_type)
+
+    # -- normalisation ----------------------------------------------------- #
+    def _normalise(
+        self, segments: Sequence[ClassifiedSegment], document: DocumentText
+    ) -> list[ClassifiedSegment]:
         """Sort segments, clamp them to the document and cover unassigned pages."""
         page_count = max(document.page_count, 1)
         cleaned: list[ClassifiedSegment] = []
@@ -969,7 +1226,7 @@ class DocumentClassifier:
         covered = {page for segment in cleaned for page in range(segment.start_page, segment.end_page + 1)}
         missing = [number for number in range(1, page_count + 1) if number not in covered]
         if missing and cleaned:
-            # Attach stray pages to the preceding segment instead of losing them.
+            # Attach stray pages to the nearest segment instead of losing them.
             for number in missing:
                 target = min(cleaned, key=lambda seg: abs(seg.start_page - number))
                 target.end_page = max(target.end_page, number)

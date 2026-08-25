@@ -152,8 +152,13 @@ class ProcessingPipeline:
 
     @property
     def ai_enabled(self) -> bool:
-        """True when Azure OpenAI extraction is active."""
+        """True when an LLM fallback backs up the rule engine."""
         return self._classifier.ai_enabled
+
+    @property
+    def llm_name(self) -> str:
+        """Name of the active fallback backend, or ``"rules only"``."""
+        return self._classifier.llm_name
 
     # -- processing -------------------------------------------------------- #
     def process_batch(

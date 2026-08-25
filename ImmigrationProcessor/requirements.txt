@@ -4,7 +4,12 @@ streamlit>=1.36,<2.0                    # UI incl. drag & drop uploads   [1.62.0
 PyMuPDF>=1.24,<2.0                      # text extraction, split, render [1.28.2]
 python-dotenv>=1.0,<2.0                 # .env loading                   [1.2.3]
 
-# --- Azure services ---------------------------------------------------------
+# --- Local LLM fallback (Ollama) --------------------------------------------
+# No Python package needed: the provider talks HTTP through the standard
+# library. Install the server from https://ollama.com and pull a model, e.g.
+#   ollama pull qwen2.5:7b-instruct
+
+# --- Azure services (optional cloud alternative) -----------------------------
 openai>=1.40,<4.0                       # AzureOpenAI chat completions   [3.3.1]
 azure-ai-documentintelligence>=1.0,<2.0 # OCR (prebuilt-read)            [1.0.2]
 azure-core>=1.30,<2.0

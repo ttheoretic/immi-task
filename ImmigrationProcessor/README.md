@@ -105,6 +105,41 @@ zweites Browserfenster neben dem Pane aufgeht.
 * Optional for local OCR without Azure: the tesseract binary
   (`brew install tesseract tesseract-lang` / `apt-get install tesseract-ocr tesseract-ocr-deu`)
 
+## Two stages: rules first, model only as fallback
+
+The extraction runs in two stages, and the first one needs no model at all:
+
+1. **Rule engine** (always on, deterministic, reproducible, offline)
+   * passport MRZ **including all ICAO check digits** - a verified MRZ is
+     arithmetically confirmed rather than guessed, and always wins over model
+     output,
+   * anchors per document type (`Husband:`, `Abrechnungsmonat:`,
+     `zwischen <Firma> und`, the city behind a German postal code),
+   * generic labelled fields (`Surname:`, `Arbeitgeber:`, `gültig bis`).
+2. **LLM fallback** - only the documents the rules could *not* resolve are
+   handed to a model: a local Ollama by default, Azure OpenAI when configured
+   that way. If the page grouping itself looks doubtful, the whole document is
+   re-analysed by the model.
+
+The confidence follows the evidence: a verified MRZ scores 0.95, every file
+name field from a labelled anchor scores `RULE_TRUSTED_CONFIDENCE` (0.92), and
+anything guessed stays below the review threshold. A missing company always
+keeps a document in review - the file name would otherwise carry `UNKNOWN`.
+
+### Local model with Ollama (no API, no data leaving the machine)
+
+```bash
+# 1. install from https://ollama.com, then pull a model
+ollama pull qwen2.5:7b-instruct
+# 2. in .env
+LLM_PROVIDER=auto            # a reachable Ollama wins over the cloud
+OLLAMA_MODEL=qwen2.5:7b-instruct
+```
+
+With `LLM_PROVIDER=none` the app runs on rules alone; everything the rules
+cannot settle simply lands in `data/review`. Combined with local tesseract OCR
+that is a fully offline pipeline.
+
 ## Workflow
 
 ```
@@ -113,9 +148,7 @@ Upload -> Analyze -> Classify -> Split -> Rename -> Review -> Export
 
 1. **Analyze** - PyMuPDF reads the text layer; pages without one go to Azure
    Document Intelligence (`prebuilt-read`), or to a local tesseract fallback.
-2. **Classify** - Azure OpenAI detects document boundaries, the document type
-   and the personal data. Without credentials a keyword/MRZ/regex engine takes
-   over with a capped confidence.
+2. **Classify** - the two stages above: rules first, model only where needed.
 3. **Split** - one PDF per detected document.
 4. **Rename** - `<DocumentType>_<LastName>_<FirstName>_<CompanyName>.pdf`,
    e.g. `01_passport_valid 15.08.2032_Smith_John_Microsoft.pdf`.
@@ -136,7 +169,8 @@ ImmigrationProcessor/
 ├── run.sh / run.bat       one click launchers
 ├── run.command            macOS double-click launcher
 ├── data/                  incoming | processed (Clients/) | review | temp
-├── modules/               ocr, classifier, pdf_splitter, renamer,
+├── modules/               ocr, classifier (rule engine), llm_providers
+│                          (Ollama + Azure), pdf_splitter, renamer,
 │                          folder_manager, export, validation, pipeline
 ├── prompts/               Azure OpenAI system prompt
 └── logs/processing.log    every action, with confidence and file name
@@ -149,7 +183,11 @@ All settings live in `.env` (see the comments in that file). The most relevant:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CONFIDENCE_THRESHOLD` | `0.90` | below this: `REVIEW REQUIRED`, no auto export |
-| `HEURISTIC_CONFIDENCE_CAP` | `0.55` | ceiling for results produced without AI |
+| `LLM_PROVIDER` | `auto` | `auto` / `ollama` / `azure` / `none` - which model backs up the rules |
+| `RULES_FIRST` | `true` | rules first, model only for what they cannot resolve |
+| `OLLAMA_MODEL` | `qwen2.5:7b-instruct` | local model used as the fallback |
+| `RULE_TRUSTED_CONFIDENCE` | `0.92` | confidence when every field came from a labelled anchor |
+| `HEURISTIC_CONFIDENCE_CAP` | `0.55` | ceiling for keyword-only matches |
 | `OCR_MIN_CHARS_PER_PAGE` | `60` | fewer characters on a page: treat it as scanned |
 | `CLIENTS_ROOT` | `data/processed/Clients` | where the client folders live |
 | `MAX_UPLOAD_MB` | `50` | upload size limit |

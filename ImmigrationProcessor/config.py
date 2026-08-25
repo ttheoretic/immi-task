@@ -142,6 +142,50 @@ class DocumentIntelligenceSettings:
 
 
 @dataclass(frozen=True)
+class OllamaSettings:
+    """Connection details for a locally running Ollama server.
+
+    Ollama is the "AI without an API" option: the model runs on your own
+    hardware, so no client data leaves the machine and there are no per-token
+    costs. It is used as the fallback for documents the rule engine cannot
+    resolve on its own.
+    """
+
+    host: str
+    model: str
+    temperature: float
+    timeout: float
+    keep_alive: str
+    num_ctx: int
+
+    @property
+    def is_configured(self) -> bool:
+        """True when a host and a model name are set."""
+        return bool(self.host and self.model)
+
+    @property
+    def chat_url(self) -> str:
+        """Full URL of the ``/api/chat`` endpoint."""
+        return f"{self.host.rstrip('/')}/api/chat"
+
+    @property
+    def tags_url(self) -> str:
+        """Full URL of the ``/api/tags`` endpoint (used for health checks)."""
+        return f"{self.host.rstrip('/')}/api/tags"
+
+    @classmethod
+    def load(cls) -> "OllamaSettings":
+        return cls(
+            host=_env("OLLAMA_HOST", "http://localhost:11434"),
+            model=_env("OLLAMA_MODEL", "qwen2.5:7b-instruct"),
+            temperature=_env_float("OLLAMA_TEMPERATURE", 0.0),
+            timeout=_env_float("OLLAMA_TIMEOUT_SECONDS", 180.0),
+            keep_alive=_env("OLLAMA_KEEP_ALIVE", "10m"),
+            num_ctx=_env_int("OLLAMA_NUM_CTX", 8192),
+        )
+
+
+@dataclass(frozen=True)
 class Paths:
     """Filesystem layout of the application."""
 
@@ -199,34 +243,68 @@ class Settings:
 
     azure_openai: AzureOpenAISettings
     document_intelligence: DocumentIntelligenceSettings
+    ollama: OllamaSettings
     paths: Paths
     confidence_threshold: float
     heuristic_confidence_cap: float
+    rule_trusted_confidence: float
     ocr_min_chars_per_page: int
     max_upload_mb: int
     log_level: str
     unknown_token: str
+    llm_provider: str
+    rules_first: bool
 
     @classmethod
     def load(cls) -> "Settings":
         return cls(
             azure_openai=AzureOpenAISettings.load(),
             document_intelligence=DocumentIntelligenceSettings.load(),
+            ollama=OllamaSettings.load(),
             paths=Paths.load(),
             confidence_threshold=_env_float("CONFIDENCE_THRESHOLD", 0.90),
-            # Heuristic (non-AI) results can never reach the auto-export
+            # Weak rule matches (keywords only) can never reach the auto-export
             # threshold: a human always reviews them.
             heuristic_confidence_cap=_env_float("HEURISTIC_CONFIDENCE_CAP", 0.55),
+            # Confidence granted when every mandatory field was read from an
+            # explicit, labelled anchor (or a checksum-verified passport MRZ).
+            rule_trusted_confidence=_env_float("RULE_TRUSTED_CONFIDENCE", 0.92),
             ocr_min_chars_per_page=_env_int("OCR_MIN_CHARS_PER_PAGE", 60),
             max_upload_mb=_env_int("MAX_UPLOAD_MB", 50),
             log_level=_env("LOG_LEVEL", "INFO").upper(),
             unknown_token=_env("UNKNOWN_TOKEN", "UNKNOWN"),
+            # auto | ollama | azure | none - which LLM backs up the rule engine.
+            llm_provider=_env("LLM_PROVIDER", "auto").lower(),
+            # When True the deterministic rule engine runs first and the LLM is
+            # only asked about documents the rules could not resolve.
+            rules_first=_env_bool("RULES_FIRST", True),
         )
 
     @property
     def ai_enabled(self) -> bool:
-        """True when Azure OpenAI extraction is available."""
-        return self.azure_openai.is_configured
+        """True when any LLM backend is available as a fallback."""
+        return self.active_llm_provider != "none"
+
+    @property
+    def active_llm_provider(self) -> str:
+        """Resolve ``LLM_PROVIDER`` against what is actually configured.
+
+        Returns ``"ollama"``, ``"azure"`` or ``"none"``. In ``auto`` mode the
+        local model wins over the cloud, so data stays on the machine unless
+        the operator asks for Azure explicitly.
+        """
+        choice = self.llm_provider
+        if choice == "none":
+            return "none"
+        if choice == "ollama":
+            return "ollama" if self.ollama.is_configured else "none"
+        if choice == "azure":
+            return "azure" if self.azure_openai.is_configured else "none"
+        if self.ollama.is_configured:
+            return "ollama"
+        if self.azure_openai.is_configured:
+            return "azure"
+        return "none"
 
     @property
     def ocr_enabled(self) -> bool:
